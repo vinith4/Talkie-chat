@@ -4,6 +4,7 @@ import { sb } from "@/lib/supabase";
 import { WebRTCService, getIceServers, type CallKind, type CallState } from "@/lib/webrtc/webrtc-service";
 import { audioRunning, chime, startRing, unlockAudio } from "@/lib/webrtc/sounds";
 import { enablePush, pushSupported, registerWorker } from "@/lib/push";
+import { Avatar } from "@/components/Avatar";
 import "./calls.css";
 import "./calls-mini.css";
 import "./calls-extra.css";
@@ -425,7 +426,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
           <div className="cinfo">
             <h2>{call.peerName}</h2>
             <p>{status}</p>
-            {showAvatar && <div className="cavatar">{(call.peerName[0] ?? "?").toUpperCase()}</div>}
+            {showAvatar && <Avatar userId={call.peerId} name={call.peerName} className="cavatar" />}
           </div>
           {isVideo && call.phase !== "incoming" && (
             <div

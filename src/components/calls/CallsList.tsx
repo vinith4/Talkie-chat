@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { sb } from "@/lib/supabase";
+import { Avatar } from "@/components/Avatar";
 
 type Row = {
   id: string; caller_id: string; receiver_id: string; call_type: "VOICE" | "VIDEO"; status: string;
@@ -49,10 +50,10 @@ export function CallsList({ meId }: { meId: string }) {
         const outgoing = r.caller_id === meId;
         const name = (outgoing ? r.receiver : r.caller)?.display_name ?? "Unknown";
         const missed = !outgoing && r.status === "MISSED";
-        const label = missed ? "Missed" : r.status === "REJECTED" ? (outgoing ? "Declined" : "Declined") : r.status === "MISSED" ? "No answer" : r.duration ? fmt(r.duration) : "Call";
+        const label = missed ? "Missed" : r.status === "REJECTED" ? "Declined" : r.status === "MISSED" ? "No answer" : r.duration ? fmt(r.duration) : "Call";
         return (
           <div key={r.id} className="crow">
-            <span className="avatar">{(name[0] ?? "?").toUpperCase()}</span>
+            <Avatar userId={outgoing ? r.receiver_id : r.caller_id} name={name} />
             <div className="grow">
               <div className={missed ? "miss" : undefined}>{name}</div>
               <div className={`muted${missed ? " miss" : ""}`}>

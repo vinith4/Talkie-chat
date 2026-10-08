@@ -5,6 +5,7 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { sb } from "@/lib/supabase";
 import { CallLayer } from "@/components/calls/CallLayer";
 import { CallsList } from "@/components/calls/CallsList";
+import { Avatar } from "@/components/Avatar";
 import "./chat.css";
 import "./tabs.css";
 
@@ -17,7 +18,6 @@ type MemberRow = { conversation_id: string; user_id: string; conversations: { ty
 type PresenceMeta = { typing?: boolean; name?: string };
 
 const EMOJIS = ["👍", "❤️", "😂", "😮", "🙏"];
-const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
 
 export default function ChatPage() {
   const router = useRouter();
@@ -285,7 +285,7 @@ export default function ChatPage() {
           <div className="list">
             {results.map((p) => (
               <button key={p.id} className="item" onClick={() => (grpMode ? setGrpMembers((c) => (c.some((x) => x.id === p.id) ? c : [...c, p])) : startChat(p))}>
-                <span className="avatar">{initial(p.display_name)}</span>
+                <Avatar userId={p.id} name={p.display_name} />
                 <span><div>{p.display_name}</div><div className="muted">@{p.username} · {grpMode ? "add to group" : "start chat"}</div></span>
               </button>
             ))}
@@ -293,7 +293,7 @@ export default function ChatPage() {
             {!loading && !convs.length && !results.length && <p className="empty" style={{ padding: 24 }}>No conversations yet.<br />Search for someone to start one.</p>}
             {convs.map((c) => (
               <button key={c.id} className="item" aria-current={active?.id === c.id} onClick={() => setActive(c)}>
-                <span className="avatar">{c.isGroup ? "#" : initial(c.title)}</span>
+                {c.isGroup ? <span className="avatar">#</span> : <Avatar userId={c.otherId} name={c.title} />}
                 <span>{c.title}{c.otherId && online.has(c.otherId) && <span className="dot" aria-label="online" />}</span>
               </button>
             ))}
@@ -309,7 +309,7 @@ export default function ChatPage() {
           <>
             <header>
               <button className="ghost back" onClick={() => setActive(null)} aria-label="Back">←</button>
-              <span className="avatar">{active.isGroup ? "#" : initial(active.title)}</span>
+              {active.isGroup ? <span className="avatar">#</span> : <Avatar userId={active.otherId} name={active.title} />}
               <span className="top"><span><strong>{active.title}</strong><small>{active.isGroup ? `${members.length} members` : active.otherId && online.has(active.otherId) ? "Online" : "Offline"}</small></span></span>
               {active.isGroup && <button className="ghost" onClick={leaveGroup}>Leave</button>}
             </header>
