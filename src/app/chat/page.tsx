@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { sb } from "@/lib/supabase";
+import { CallLayer } from "@/components/calls/CallLayer";
 import "./chat.css";
 
 type Msg = { id: string; conversation_id: string; sender_id: string; content: string; reply_to_message_id: string | null; is_edited: boolean; is_deleted: boolean; created_at: string };
@@ -350,6 +351,7 @@ export default function ChatPage() {
         )}
         {error && <div className="err" role="alert" style={{ padding: 8 }} onClick={() => setError("")}>{error}</div>}
       </main>
+      {meId && <CallLayer meId={meId} myName={myName} peer={active && !active.isGroup && active.otherId ? { id: active.otherId, name: active.title, conversationId: active.id } : null} />}
     </div>
   );
 }
