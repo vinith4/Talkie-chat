@@ -1,7 +1,8 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { sb } from "@/lib/supabase";
-import { WebRTCService, type CallKind, type CallState } from "@/lib/webrtc/webrtc-service";
+import { WebRTCService, getIceServers, type CallKind, type CallState } from "@/lib/webrtc/webrtc-service";
+import { chime, startRing } from "@/lib/webrtc/sounds";
 import "./calls.css";
 import "./calls-mini.css";
 
@@ -18,6 +19,7 @@ type Outcome = "ENDED" | "REJECTED" | "MISSED";
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 const reason = (e: unknown) =>
   e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "NotFoundError") ? "Allow microphone/camera access to make calls."
+    : e instanceof DOMException && e.name === "NotReadableError" ? "Camera or microphone is being used by another app or window."
     : e instanceof Error ? e.message : "Call failed";
 
 /** Signaling is stored in `call_signals` and delivered via Postgres Changes (reliable, RLS-protected). */
@@ -45,11 +47,10 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (error) throw new Error(error.message.includes("row-level") ? "You can't call this person (blocked?)" : "Could not reach the other person");
   }
 
-  function cleanup() {
-    const c = cur.current;
+  function cleanup(callId?: string) {
     if (timer.current) clearTimeout(timer.current);
     svc.current?.close(); svc.current = null;
-    if (c) void sb().from("call_signals").delete().eq("call_id", c.callId).then(() => {});
+    if (callId) void sb().from("call_signals").delete().eq("call_id", callId).then(() => {});
     update(null); setMuted(false); setCamOff(false); setMini(false); setSecs(0);
   }
 
@@ -68,22 +69,25 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     const c = cur.current;
     if (!c) return;
     const dur = c.startedAt ? Math.round((Date.now() - c.startedAt) / 1000) : 0;
+    chime("end");
     const done = notify ? send(c.peerId, { type: "call-end", callId: c.callId }).catch(() => {}) : Promise.resolve();
     if (c.outgoing) void log(c, status, dur).catch(() => {});
-    // Let the end signal go out before clearing this call's signal rows
-    void done.then(() => cleanup());
-    svc.current?.close(); svc.current = null; update(null);
+    void done.then(() => { void sb().from("call_signals").delete().eq("call_id", c.callId).then(() => {}); });
+    cleanup();
   }
 
   function onState(st: CallState) {
     const c = cur.current;
     if (!c) return;
-    if (st === "connected" && !c.startedAt) update({ ...c, phase: "connected", startedAt: Date.now() });
+    if (st === "connected" && !c.startedAt) { chime("connect"); update({ ...c, phase: "connected", startedAt: Date.now() }); }
     else if (st === "failed") { setNote("Connection failed. A TURN server may be needed on this network."); finish(c.startedAt ? "ENDED" : "MISSED", true); }
   }
 
   function makeService(peerId: string, callId: string) {
-    const s = new WebRTCService((cand) => void send(peerId, { type: "ice-candidate", callId, candidate: cand }).catch(() => {}), onState);
+    const s = new WebRTCService(
+      (cand) => void send(peerId, { type: "ice-candidate", callId, candidate: cand }).catch(() => {}),
+      onState, getIceServers(), () => setTick((t) => t + 1),
+    );
     svc.current = s;
     return s;
   }
@@ -100,7 +104,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
       timer.current = setTimeout(() => {
         if (cur.current?.callId === callId && !cur.current.startedAt && cur.current.phase === "outgoing") { setNote("No answer"); finish("MISSED", true); }
       }, 40000);
-    } catch (e) { setNote(reason(e)); cleanup(); }
+    } catch (e) { setNote(reason(e)); cleanup(callId); }
   }
 
   async function accept() {
@@ -114,15 +118,15 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
       await send(c.peerId, { type: "call-accept", callId: c.callId });
     } catch (e) {
       void send(c.peerId, { type: "call-reject", callId: c.callId }).catch(() => {});
-      setNote(reason(e)); cleanup();
+      setNote(reason(e)); cleanup(c.callId);
     }
   }
 
   function reject() {
     const c = cur.current;
     if (!c) return;
-    void send(c.peerId, { type: "call-reject", callId: c.callId }).catch(() => {}).then(() => cleanup());
-    svc.current?.close(); svc.current = null; update(null);
+    void send(c.peerId, { type: "call-reject", callId: c.callId }).catch(() => {});
+    cleanup();
   }
 
   async function handle(m: Sig) {
@@ -170,28 +174,25 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => { void sb().removeChannel(ch); svc.current?.close(); svc.current = null; };
   }, [meId]);
 
-  // Ringtone while a call is incoming
+  // Phone-style sounds: ringtone for the callee, ringback for the caller
   useEffect(() => {
-    if (call?.phase !== "incoming") return;
-    let ctx: AudioContext | null = null;
-    try { ctx = new AudioContext(); } catch { ctx = null; }
-    const beep = () => {
-      if (!ctx) return;
-      const o = ctx.createOscillator(); const g = ctx.createGain();
-      o.frequency.value = 480; g.gain.value = 0.15; o.connect(g); g.connect(ctx.destination);
-      o.start(); o.stop(ctx.currentTime + 0.5);
-    };
-    beep();
-    const id = setInterval(beep, 1600);
-    return () => { clearInterval(id); void ctx?.close(); };
+    if (call?.phase === "incoming") return startRing("ringtone");
+    if (call?.phase === "outgoing") return startRing("ringback");
+    return undefined;
   }, [call?.phase]);
 
-  // Attach media streams
+  // Attach media streams (re-run whenever a remote track arrives)
   useEffect(() => {
-    if (!svc.current) return;
-    if (remoteRef.current) remoteRef.current.srcObject = svc.current.remoteStream;
-    if (localRef.current) localRef.current.srcObject = svc.current.localStream;
-  }, [call?.phase, tick]);
+    const s = svc.current;
+    if (!s) return;
+    const attach = (el: HTMLVideoElement | null, stream: MediaStream | null) => {
+      if (!el || !stream) return;
+      if (el.srcObject !== stream) el.srcObject = stream;
+      void el.play().catch(() => {});
+    };
+    attach(remoteRef.current, s.remoteStream);
+    attach(localRef.current, s.localStream);
+  }, [call?.phase, tick, mini]);
 
   useEffect(() => {
     const start = call?.startedAt;
@@ -206,7 +207,8 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => clearTimeout(id);
   }, [note]);
 
-  const status = !call ? "" : call.phase === "incoming" ? `Incoming ${call.kind === "VIDEO" ? "video" : "voice"} call` : call.phase === "outgoing" ? "Calling…" : call.phase === "connecting" ? "Connecting…" : fmt(secs);
+  const noRemoteVideo = !!call && call.kind === "VIDEO" && call.phase === "connected" && !svc.current?.remoteStream.getVideoTracks().length;
+  const status = !call ? "" : call.phase === "incoming" ? `Incoming ${call.kind === "VIDEO" ? "video" : "voice"} call` : call.phase === "outgoing" ? "Ringing…" : call.phase === "connecting" ? "Connecting…" : noRemoteVideo ? `${fmt(secs)} · waiting for their camera…` : fmt(secs);
 
   return (
     <>
@@ -220,7 +222,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
         <div className={`callov${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
           <video ref={remoteRef} autoPlay playsInline className={call.kind === "VIDEO" ? "remote" : "remote off"} />
           <div className="calltop"><strong>{call.peerName}</strong><span>{status}</span></div>
-          {!(call.kind === "VIDEO" && call.phase === "connected") && (
+          {(!(call.kind === "VIDEO" && call.phase === "connected") || noRemoteVideo) && (
             <div className="callmid"><span className="avatar">{(call.peerName[0] ?? "?").toUpperCase()}</span><h2>{call.peerName}</h2><p>{status}</p></div>
           )}
           {call.kind === "VIDEO" && call.phase !== "incoming" && <video ref={localRef} autoPlay playsInline muted className="local" />}

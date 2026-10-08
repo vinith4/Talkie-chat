@@ -1,16 +1,10 @@
-import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
-
 export type CallState = "idle" | "calling" | "ringing" | "connecting" | "connected" | "ended" | "failed";
 export type CallKind = "VOICE" | "VIDEO";
 
-export type SignalMessage =
-  | { type: "call-start"; from: string; callId: string; kind: CallKind }
-  | { type: "call-accept" | "call-reject" | "call-end"; from: string; callId: string }
-  | { type: "offer" | "answer"; from: string; callId: string; sdp: RTCSessionDescriptionInit }
-  | { type: "ice-candidate"; from: string; callId: string; candidate: RTCIceCandidateInit };
-
 export function getIceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  const servers: RTCIceServer[] = [
+    { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  ];
   const url = process.env.NEXT_PUBLIC_TURN_URL;
   if (url) {
     servers.push({
@@ -20,26 +14,6 @@ export function getIceServers(): RTCIceServer[] {
     });
   }
   return servers;
-}
-
-/** Signaling over Supabase Broadcast: each user listens on `calls:<userId>`. */
-export class SignalingChannel {
-  private inbox: RealtimeChannel;
-  constructor(private supabase: SupabaseClient, private me: string, onSignal: (m: SignalMessage) => void) {
-    this.inbox = supabase
-      .channel(`calls:${me}`)
-      .on("broadcast", { event: "signal" }, ({ payload }) => onSignal(payload as SignalMessage))
-      .subscribe();
-  }
-  async send(to: string, msg: SignalMessage): Promise<void> {
-    const ch = this.supabase.channel(`calls:${to}`);
-    await new Promise<void>((resolve, reject) =>
-      ch.subscribe((s) => (s === "SUBSCRIBED" ? resolve() : s === "CHANNEL_ERROR" ? reject(new Error("Signaling failed")) : undefined)),
-    );
-    await ch.send({ type: "broadcast", event: "signal", payload: msg });
-    void this.supabase.removeChannel(ch);
-  }
-  close(): void { void this.supabase.removeChannel(this.inbox); }
 }
 
 /** Owns one RTCPeerConnection. No React, no Supabase: fully unit-testable. */
@@ -53,10 +27,14 @@ export class WebRTCService {
     private onCandidate: (c: RTCIceCandidateInit) => void,
     private onState: (s: CallState) => void,
     iceServers: RTCIceServer[] = getIceServers(),
+    private onTrack?: () => void,
   ) {
     this.pc = new RTCPeerConnection({ iceServers });
     this.pc.onicecandidate = (e) => e.candidate && this.onCandidate(e.candidate.toJSON());
-    this.pc.ontrack = (e) => e.streams[0]?.getTracks().forEach((t) => this.remoteStream.addTrack(t));
+    this.pc.ontrack = (e) => {
+      if (!this.remoteStream.getTracks().includes(e.track)) this.remoteStream.addTrack(e.track);
+      this.onTrack?.();
+    };
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState;
       if (s === "connected") this.onState("connected");
@@ -66,7 +44,10 @@ export class WebRTCService {
   }
 
   async startMedia(kind: CallKind): Promise<MediaStream> {
-    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: kind === "VIDEO" });
+    this.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: kind === "VIDEO" ? { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+    });
     this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream!));
     return this.localStream;
   }
@@ -74,7 +55,7 @@ export class WebRTCService {
   async createOffer(): Promise<RTCSessionDescriptionInit> {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-    return offer;
+    return { type: offer.type, sdp: offer.sdp };
   }
 
   async acceptOffer(offer: RTCSessionDescriptionInit): Promise<RTCSessionDescriptionInit> {
@@ -82,7 +63,7 @@ export class WebRTCService {
     await this.flushPending();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    return answer;
+    return { type: answer.type, sdp: answer.sdp };
   }
 
   async acceptAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
