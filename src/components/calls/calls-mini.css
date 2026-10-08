@@ -1,7 +1,9 @@
-.callov.mini{inset:auto 12px 12px auto;width:270px;height:auto;min-height:0;border-radius:16px;padding:10px;display:block;box-shadow:0 8px 32px #0008}
-.callov.mini .remote{position:relative;inset:auto;height:140px;border-radius:12px}
-.callov.mini .remote.off{height:1px}
-.callov.mini .callmid,.callov.mini .local{display:none}
-.callov.mini .calltop{position:static;background:none;padding:4px 2px}
-.callov.mini .ctrls{position:static;padding:8px 0 0;gap:6px}
-.callov.mini .ctrls button{padding:8px 12px;font-size:13px}
+.callov.mini{inset:auto 12px 12px auto;width:200px;height:270px;border-radius:18px;box-shadow:0 8px 32px #000a}
+.callov.mini .cinfo{top:12px}
+.callov.mini .cinfo h2{font-size:18px}
+.callov.mini .cinfo p{font-size:13px;margin-top:2px}
+.callov.mini .cavatar{width:72px;height:72px;font-size:28px;margin-top:14px}
+.callov.mini .local,.callov.mini .ctop,.callov.mini .pill,.callov.mini .sheet{display:none}
+.minibar{position:absolute;left:8px;right:8px;bottom:8px;display:flex;justify-content:space-around;z-index:3}
+.minibar button{width:44px;height:44px;border-radius:50%;background:#2a2e37;color:#fff;display:grid;place-items:center;padding:0;border:0}
+.minibar .end{background:#e11d48}

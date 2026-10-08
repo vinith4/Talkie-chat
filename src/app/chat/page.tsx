@@ -4,7 +4,9 @@ import { useRouter } from "next/navigation";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { sb } from "@/lib/supabase";
 import { CallLayer } from "@/components/calls/CallLayer";
+import { CallsList } from "@/components/calls/CallsList";
 import "./chat.css";
+import "./tabs.css";
 
 type Msg = { id: string; conversation_id: string; sender_id: string; content: string; reply_to_message_id: string | null; is_edited: boolean; is_deleted: boolean; created_at: string };
 type Prof = { id: string; display_name: string; username: string };
@@ -19,6 +21,7 @@ const initial = (s: string) => (s.trim()[0] ?? "?").toUpperCase();
 
 export default function ChatPage() {
   const router = useRouter();
+  const [tab, setTab] = useState<"chats" | "calls">("chats");
   const [meId, setMeId] = useState<string | null>(null);
   const [myName, setMyName] = useState("Someone");
   const [convs, setConvs] = useState<Conv[]>([]);
@@ -266,32 +269,40 @@ export default function ChatPage() {
     <div className={`app${active ? " open" : ""}`}>
       <aside className="side">
         <header>
-          <div className="row"><strong>Talkie</strong><span><button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button> <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
-          {grpMode && (
+          <div className="row"><strong>{tab === "chats" ? "Talkie" : "Calls"}</strong><span>{tab === "chats" && <button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button>} <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
+          {tab === "chats" && grpMode && (
             <>
               <input aria-label="Group name" placeholder="Group name" value={grpName} onChange={(e) => setGrpName(e.target.value)} />
               <div className="chips">{grpMembers.map((g) => <span key={g.id} className="chip">{g.display_name}</span>)}</div>
               <button onClick={createGroup}>Create group</button>
             </>
           )}
-          <input aria-label="Search people" placeholder={grpMode ? "Search people to add" : "Find people to chat with"} value={query} onChange={(e) => setQuery(e.target.value)} />
+          {tab === "chats" && <input aria-label="Search people" placeholder={grpMode ? "Search people to add" : "Find people to chat with"} value={query} onChange={(e) => setQuery(e.target.value)} />}
         </header>
-        <div className="list">
-          {results.map((p) => (
-            <button key={p.id} className="item" onClick={() => (grpMode ? setGrpMembers((c) => (c.some((x) => x.id === p.id) ? c : [...c, p])) : startChat(p))}>
-              <span className="avatar">{initial(p.display_name)}</span>
-              <span><div>{p.display_name}</div><div className="muted">@{p.username} · {grpMode ? "add to group" : "start chat"}</div></span>
-            </button>
-          ))}
-          {loading && <p className="muted" style={{ padding: 14 }}>Loading…</p>}
-          {!loading && !convs.length && !results.length && <p className="empty" style={{ padding: 24 }}>No conversations yet.<br />Search for someone to start one.</p>}
-          {convs.map((c) => (
-            <button key={c.id} className="item" aria-current={active?.id === c.id} onClick={() => setActive(c)}>
-              <span className="avatar">{c.isGroup ? "#" : initial(c.title)}</span>
-              <span>{c.title}{c.otherId && online.has(c.otherId) && <span className="dot" aria-label="online" />}</span>
-            </button>
-          ))}
-        </div>
+        {tab === "calls" ? (
+          <div className="list">{meId && <CallsList meId={meId} />}</div>
+        ) : (
+          <div className="list">
+            {results.map((p) => (
+              <button key={p.id} className="item" onClick={() => (grpMode ? setGrpMembers((c) => (c.some((x) => x.id === p.id) ? c : [...c, p])) : startChat(p))}>
+                <span className="avatar">{initial(p.display_name)}</span>
+                <span><div>{p.display_name}</div><div className="muted">@{p.username} · {grpMode ? "add to group" : "start chat"}</div></span>
+              </button>
+            ))}
+            {loading && <p className="muted" style={{ padding: 14 }}>Loading…</p>}
+            {!loading && !convs.length && !results.length && <p className="empty" style={{ padding: 24 }}>No conversations yet.<br />Search for someone to start one.</p>}
+            {convs.map((c) => (
+              <button key={c.id} className="item" aria-current={active?.id === c.id} onClick={() => setActive(c)}>
+                <span className="avatar">{c.isGroup ? "#" : initial(c.title)}</span>
+                <span>{c.title}{c.otherId && online.has(c.otherId) && <span className="dot" aria-label="online" />}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        <nav className="tabs" aria-label="Sections">
+          <button aria-current={tab === "chats"} onClick={() => setTab("chats")}><span aria-hidden="true">💬</span>Chats</button>
+          <button aria-current={tab === "calls"} onClick={() => setTab("calls")}><span aria-hidden="true">📞</span>Calls</button>
+        </nav>
       </aside>
       <main className="chat">
         {!active ? <p className="empty">Select a conversation</p> : (

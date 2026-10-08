@@ -1,0 +1,7 @@
+.tabs{display:flex;border-top:1px solid var(--border);background:var(--card);padding-bottom:env(safe-area-inset-bottom,0px)}
+.tabs button{flex:1;background:transparent;color:var(--muted);border-radius:0;padding:10px 8px;font-size:13px;display:grid;gap:2px;justify-items:center}
+.tabs button[aria-current=true]{color:var(--accent);font-weight:600}
+.crow{display:flex;align-items:center;gap:10px;padding:10px 14px}
+.crow .grow{flex:1;min-width:0}
+.crow .miss{color:#dc2626}
+.crow button{background:transparent;color:var(--accent);padding:6px 8px;font-size:18px}

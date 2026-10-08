@@ -17,12 +17,21 @@ type Sig = {
 type SigRow = { call_id: string; from_id: string; type: SigType; payload: Partial<Sig>; created_at: string };
 type Call = { phase: "outgoing" | "incoming" | "connecting" | "connected"; kind: CallKind; peerId: string; peerName: string; conv: string; callId: string; outgoing: boolean; startedAt: number | null };
 type Outcome = "ENDED" | "REJECTED" | "MISSED";
+type SinkEl = HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+const BT = /bluetooth|buds|airpods|headset|headphone|hands-free|handsfree/i;
 const reason = (e: unknown) =>
   e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "NotFoundError") ? "Allow microphone/camera access to make calls."
     : e instanceof DOMException && e.name === "NotReadableError" ? "Camera or microphone is being used by another app or window."
     : e instanceof Error ? e.message : "Call failed";
+
+function Ico({ children }: { children: React.ReactNode }) {
+  return <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>;
+}
+const Phone = ({ rot = 0 }: { rot?: number }) => (
+  <Ico><path transform={`rotate(${rot} 12 12)`} d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z" fill="currentColor" /></Ico>
+);
 
 /** Signaling is stored in `call_signals` and delivered via Postgres Changes (reliable, RLS-protected). */
 export function CallLayer({ meId, myName, peer }: { meId: string; myName: string; peer: Peer | null }) {
@@ -30,6 +39,10 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const [muted, setMuted] = useState(false);
   const [camOff, setCamOff] = useState(false);
   const [mini, setMini] = useState(false);
+  const [sheet, setSheet] = useState<null | "audio" | "more">(null);
+  const [devs, setDevs] = useState<{ outs: MediaDeviceInfo[]; ins: MediaDeviceInfo[] }>({ outs: [], ins: [] });
+  const [outId, setOutId] = useState("");
+  const [inId, setInId] = useState("");
   const [secs, setSecs] = useState(0);
   const [note, setNote] = useState("");
   const [tick, setTick] = useState(0);
@@ -42,6 +55,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const ovRef = useRef<HTMLDivElement>(null);
   const handlerRef = useRef<(m: Sig) => void>(() => {});
   const actRef = useRef<(a: string) => void>(() => {});
+  const startRef = useRef<(k: CallKind, p?: Peer | null) => void>(() => {});
 
   function update(c: Call | null) { cur.current = c; setCall(c); }
 
@@ -55,7 +69,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (timer.current) clearTimeout(timer.current);
     svc.current?.close(); svc.current = null;
     if (callId) void sb().from("call_signals").delete().eq("call_id", callId).then(() => {});
-    update(null); setMuted(false); setCamOff(false); setMini(false); setSecs(0);
+    update(null); setMuted(false); setCamOff(false); setMini(false); setSheet(null); setOutId(""); setInId(""); setSecs(0);
   }
 
   async function log(c: Call, status: Outcome, dur: number) {
@@ -63,6 +77,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
       caller_id: meId, receiver_id: c.peerId, conversation_id: c.conv || null, call_type: c.kind, status,
       started_at: c.startedAt ? new Date(c.startedAt).toISOString() : null, ended_at: new Date().toISOString(), duration: dur,
     });
+    window.dispatchEvent(new Event("talkie:call-logged"));
     const icon = c.kind === "VIDEO" ? "📹" : "📞";
     const label = c.kind === "VIDEO" ? "Video call" : "Voice call";
     const content = status === "ENDED" ? `${icon} ${label} · ${fmt(dur)}` : status === "REJECTED" ? `${icon} ${label} declined` : `${icon} Missed ${label.toLowerCase()}`;
@@ -83,7 +98,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   function onState(st: CallState) {
     const c = cur.current;
     if (!c) return;
-    if (st === "connected" && !c.startedAt) { chime("connect"); update({ ...c, phase: "connected", startedAt: Date.now() }); }
+    if (st === "connected" && !c.startedAt) { chime("connect"); void svc.current?.tuneSenders(); update({ ...c, phase: "connected", startedAt: Date.now() }); }
     else if (st === "failed") { setNote("Connection failed. A TURN server may be needed on this network."); finish(c.startedAt ? "ENDED" : "MISSED", true); }
   }
 
@@ -96,21 +111,22 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return s;
   }
 
-  async function startCall(kind: CallKind) {
-    if (!peer || cur.current) return;
+  async function startCall(kind: CallKind, p: Peer | null = peer) {
+    if (!p || cur.current) return;
     unlockAudio();
     const callId = crypto.randomUUID();
     try {
-      const s = makeService(peer.id, callId);
-      update({ phase: "outgoing", kind, peerId: peer.id, peerName: peer.name, conv: peer.conversationId, callId, outgoing: true, startedAt: null });
+      const s = makeService(p.id, callId);
+      update({ phase: "outgoing", kind, peerId: p.id, peerName: p.name, conv: p.conversationId, callId, outgoing: true, startedAt: null });
       await s.startMedia(kind);
       setTick((t) => t + 1);
-      await send(peer.id, { type: "call-start", callId, kind, name: myName, conv: peer.conversationId });
+      await send(p.id, { type: "call-start", callId, kind, name: myName, conv: p.conversationId });
       timer.current = setTimeout(() => {
         if (cur.current?.callId === callId && !cur.current.startedAt && cur.current.phase === "outgoing") { setNote("No answer"); finish("MISSED", true); }
       }, 40000);
     } catch (e) { setNote(reason(e)); cleanup(callId); }
   }
+  startRef.current = (k, p) => void startCall(k, p ?? peer);
 
   async function accept() {
     const c = cur.current;
@@ -136,6 +152,23 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   }
 
   function toggleMute() { svc.current?.setMuted(!muted); setMuted(!muted); }
+  function toggleCam() { svc.current?.setCameraOn(camOff); setCamOff(!camOff); }
+  function flip() { svc.current?.switchCamera().then(() => setTick((t) => t + 1)).catch((e) => setNote(reason(e))); }
+  function endCall() { const c = cur.current; if (c) finish(c.startedAt ? "ENDED" : "MISSED", true); }
+
+  async function loadDevs() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const d = await navigator.mediaDevices.enumerateDevices();
+    setDevs({ outs: d.filter((x) => x.kind === "audiooutput"), ins: d.filter((x) => x.kind === "audioinput") });
+  }
+  async function chooseOut(id: string) {
+    const el = remoteRef.current as SinkEl | null;
+    if (!el?.setSinkId) { setNote("This browser can't switch speakers. Connect Bluetooth in your phone settings and it will be used automatically."); return; }
+    try { await el.setSinkId(id); setOutId(id); } catch (e) { setNote(reason(e)); }
+  }
+  async function chooseIn(id: string) {
+    try { await svc.current?.switchMic(id); setInId(id); } catch (e) { setNote(reason(e)); }
+  }
 
   async function handle(m: Sig) {
     const c = cur.current;
@@ -174,7 +207,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (a === "accept" && c.phase === "incoming") void accept();
     else if (a === "decline" && c.phase === "incoming") reject();
     else if (a === "mute" && c.phase !== "incoming") toggleMute();
-    else if (a === "end" && c.phase !== "incoming") finish(c.startedAt ? "ENDED" : "MISSED", true);
+    else if (a === "end" && c.phase !== "incoming") endCall();
   };
 
   // Incoming signals (rows addressed to me) + catch-up for a call that rang while the app was closed
@@ -199,6 +232,16 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
       });
     return () => { void sb().removeChannel(ch); svc.current?.close(); svc.current = null; };
   }, [meId]);
+
+  // Calls started from the Calls tab
+  useEffect(() => {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent<{ id: string; name: string; conversationId: string; kind: CallKind }>).detail;
+      startRef.current(d.kind, { id: d.id, name: d.name, conversationId: d.conversationId });
+    };
+    window.addEventListener("talkie:call", h);
+    return () => window.removeEventListener("talkie:call", h);
+  }, []);
 
   // Background alerts: register worker, silently re-subscribe if already allowed
   useEffect(() => {
@@ -236,6 +279,20 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (call?.phase === "outgoing") return startRing("ringback");
     return undefined;
   }, [call?.phase]);
+
+  // Audio devices: keep the list fresh and auto-route to a Bluetooth headset when one appears
+  useEffect(() => {
+    if (!call || call.phase === "incoming" || !navigator.mediaDevices) return;
+    void loadDevs();
+    const h = () => void loadDevs();
+    navigator.mediaDevices.addEventListener("devicechange", h);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", h);
+  }, [call?.phase]);
+  useEffect(() => {
+    if (!call || outId) return;
+    const bt = devs.outs.find((d) => BT.test(d.label));
+    if (bt) void chooseOut(bt.deviceId);
+  }, [devs, call?.phase]);
 
   // Ongoing-call notification with Mute / End buttons while the app is in the background
   useEffect(() => {
@@ -282,12 +339,16 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
 
   useEffect(() => {
     if (!note) return;
-    const id = setTimeout(() => setNote(""), 4000);
+    const id = setTimeout(() => setNote(""), 4500);
     return () => clearTimeout(id);
   }, [note]);
 
-  const noRemoteVideo = !!call && call.kind === "VIDEO" && call.phase === "connected" && !svc.current?.remoteStream.getVideoTracks().length;
-  const status = !call ? "" : call.phase === "incoming" ? `Incoming ${call.kind === "VIDEO" ? "video" : "voice"} call` : call.phase === "outgoing" ? "Ringing…" : call.phase === "connecting" ? "Connecting…" : noRemoteVideo ? `${fmt(secs)} · waiting for their camera…` : fmt(secs);
+  const isVideo = call?.kind === "VIDEO";
+  const noRemoteVideo = !!call && isVideo && call.phase === "connected" && !svc.current?.remoteStream.getVideoTracks().length;
+  const showAvatar = !!call && (!isVideo || call.phase !== "connected" || noRemoteVideo);
+  const btOut = devs.outs.find((d) => BT.test(d.label));
+  const btActive = !!btOut && outId === btOut.deviceId;
+  const status = !call ? "" : call.phase === "incoming" ? `Incoming ${isVideo ? "video" : "voice"} call` : call.phase === "outgoing" ? "Ringing…" : call.phase === "connecting" ? "Connecting…" : noRemoteVideo ? `${fmt(secs)} · waiting for their camera…` : fmt(secs);
 
   return (
     <>
@@ -301,30 +362,70 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
         <button className="ghost alertbtn" onClick={async () => { const r = await enablePush(true); if (r === "ok") setNeedAlerts(false); else setNote(r); }}>🔔 Turn on call alerts</button>
       )}
       {call && (
-        <div className={`callov${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
-          <video ref={remoteRef} autoPlay playsInline className={call.kind === "VIDEO" ? "remote" : "remote off"} />
-          <div className="calltop"><strong>{call.peerName}</strong><span>{status}</span></div>
-          {(!(call.kind === "VIDEO" && call.phase === "connected") || noRemoteVideo) && (
-            <div className="callmid"><span className="avatar">{(call.peerName[0] ?? "?").toUpperCase()}</span><h2>{call.peerName}</h2><p>{status}</p></div>
+        <div className={`callov${isVideo ? "" : " voice"}${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
+          <video ref={remoteRef} autoPlay playsInline className={isVideo ? "remote" : "remote off"} />
+          {isVideo && <div className="shade" />}
+          {call.phase !== "incoming" && !mini && (
+            <div className="ctop">
+              <button className="circ" onClick={() => setMini(true)} aria-label="Minimize call"><Ico><path d="M6 9l6 6 6-6" /></Ico></button>
+              {isVideo && <button className="circ" onClick={flip} aria-label="Flip camera"><Ico><path d="M20 12a8 8 0 0 0-14-5M4 4v4h4M4 12a8 8 0 0 0 14 5M20 20v-4h-4" /></Ico></button>}
+            </div>
           )}
-          {call.kind === "VIDEO" && call.phase !== "incoming" && <video ref={localRef} autoPlay playsInline muted className="local" />}
-          <div className="ctrls">
-            {call.phase === "incoming" ? (
-              <>
-                <button className="acc" onClick={accept}>Accept</button>
-                <button className="rej" onClick={reject}>Decline</button>
-              </>
-            ) : (
-              <>
-                <button onClick={() => setMini(!mini)}>{mini ? "Expand" : "Minimize"}</button>
-                <button onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</button>
-                {call.kind === "VIDEO" && <button onClick={() => { svc.current?.switchCamera().then(() => setTick((t) => t + 1)).catch((e) => setNote(reason(e))); }}>Flip camera</button>}
-                {call.kind === "VIDEO" && <button onClick={() => { svc.current?.setCameraOn(camOff); setCamOff(!camOff); }}>{camOff ? "Camera on" : "Camera off"}</button>}
-                {call.kind === "VIDEO" && !mini && <button onClick={() => void ovRef.current?.requestFullscreen()}>Fullscreen</button>}
-                <button className="rej" onClick={() => finish(call.startedAt ? "ENDED" : "MISSED", true)}>End</button>
-              </>
-            )}
+          <div className="cinfo">
+            <h2>{call.peerName}</h2>
+            <p>{status}</p>
+            {showAvatar && <div className="cavatar">{(call.peerName[0] ?? "?").toUpperCase()}</div>}
           </div>
+          {isVideo && call.phase !== "incoming" && <video ref={localRef} autoPlay playsInline muted className="local" />}
+
+          {call.phase === "incoming" ? (
+            <div className="inc">
+              <div><button className="pbtn end big" onClick={reject} aria-label="Decline"><Phone rot={135} /></button><span>Decline</span></div>
+              <div><button className="pbtn acc big" onClick={accept} aria-label="Accept"><Phone /></button><span>Accept</span></div>
+            </div>
+          ) : mini ? (
+            <div className="minibar">
+              <button onClick={() => setMini(false)} aria-label="Expand call"><Ico><path d="M6 15l6-6 6 6" /></Ico></button>
+              <button onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"}><Ico><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3" />{muted && <path d="M4 4l16 16" />}</Ico></button>
+              <button className="end" onClick={endCall} aria-label="End call"><Phone rot={135} /></button>
+            </div>
+          ) : (
+            <div className="pill">
+              <button className="pbtn" onClick={() => setSheet("more")} aria-label="More options"><Ico><circle cx="5" cy="12" r="1.6" fill="currentColor" /><circle cx="12" cy="12" r="1.6" fill="currentColor" /><circle cx="19" cy="12" r="1.6" fill="currentColor" /></Ico></button>
+              <button className={`pbtn${isVideo && camOff ? " on" : ""}`} onClick={toggleCam} disabled={!isVideo} aria-label={camOff ? "Turn camera on" : "Turn camera off"}><Ico><path d="M3 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H3zM16 11l5-3v8l-5-3z" fill="currentColor" />{camOff && <path d="M4 4l16 16" />}</Ico></button>
+              <button className={`pbtn${sheet === "audio" || btActive ? " on" : ""}`} onClick={() => { void loadDevs(); setSheet("audio"); }} aria-label="Audio output">
+                {btActive || (btOut && !outId) ? <Ico><path d="M7 7l10 10-5 5V2l5 5L7 17" /></Ico> : <Ico><path d="M4 9v6h4l5 4V5L8 9zM16 8a5 5 0 0 1 0 8" /></Ico>}
+              </button>
+              <button className={`pbtn${muted ? " on" : ""}`} onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"}><Ico><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3" />{muted && <path d="M4 4l16 16" />}</Ico></button>
+              <button className="pbtn end" onClick={endCall} aria-label="End call"><Phone rot={135} /></button>
+            </div>
+          )}
+
+          {sheet && call.phase !== "incoming" && (
+            <div className="sheet" role="menu">
+              {sheet === "more" ? (
+                <>
+                  <button onClick={() => { setMini(true); setSheet(null); }}>Minimize call</button>
+                  {isVideo && <button onClick={() => { void ovRef.current?.requestFullscreen(); setSheet(null); }}>Fullscreen</button>}
+                  {isVideo && <button onClick={() => { flip(); setSheet(null); }}>Flip camera</button>}
+                </>
+              ) : (
+                <>
+                  <h3>Speaker</h3>
+                  {devs.outs.length === 0 && <div className="hint">Using your device&apos;s default speaker. If a Bluetooth headset is connected in phone settings, calls use it automatically.</div>}
+                  {devs.outs.map((d, i) => (
+                    <button key={d.deviceId || i} role="menuitemradio" aria-checked={outId === d.deviceId} onClick={() => void chooseOut(d.deviceId)}>{d.label || (i === 0 ? "Default speaker" : `Speaker ${i + 1}`)}</button>
+                  ))}
+                  <h3>Microphone</h3>
+                  {devs.ins.map((d, i) => (
+                    <button key={d.deviceId || i} role="menuitemradio" aria-checked={inId === d.deviceId} onClick={() => void chooseIn(d.deviceId)}>{d.label || `Microphone ${i + 1}`}</button>
+                  ))}
+                  <div className="hint">Pair Bluetooth headsets in your phone settings first. Then pick them here.</div>
+                </>
+              )}
+              <button onClick={() => setSheet(null)}>Close</button>
+            </div>
+          )}
         </div>
       )}
       {note && <div className="toast" role="status">{note}</div>}

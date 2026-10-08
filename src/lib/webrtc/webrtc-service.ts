@@ -16,6 +16,8 @@ export function getIceServers(): RTCIceServer[] {
   return servers;
 }
 
+const AUDIO = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } } as const;
+
 /** Owns one RTCPeerConnection. No React, no Supabase: fully unit-testable. */
 export class WebRTCService {
   private pc: RTCPeerConnection;
@@ -46,11 +48,25 @@ export class WebRTCService {
 
   async startMedia(kind: CallKind): Promise<MediaStream> {
     this.localStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true },
+      audio: AUDIO,
       video: kind === "VIDEO" ? { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } : false,
     });
+    this.localStream.getAudioTracks().forEach((t) => { t.contentHint = "speech"; });
     this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream!));
     return this.localStream;
+  }
+
+  /** Cap bitrates so video can't starve the voice stream (clearer audio). */
+  async tuneSenders(): Promise<void> {
+    for (const s of this.pc.getSenders()) {
+      if (!s.track) continue;
+      try {
+        const p = s.getParameters();
+        if (!p.encodings?.length) p.encodings = [{}];
+        p.encodings[0].maxBitrate = s.track.kind === "audio" ? 64000 : 1200000;
+        await s.setParameters(p);
+      } catch { /* not supported */ }
+    }
   }
 
   /** Switch between front and back camera without renegotiating the call. */
@@ -62,13 +78,11 @@ export class WebRTCService {
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: next }, width: { ideal: 1280 }, height: { ideal: 720 } } });
       const track = s.getVideoTracks()[0];
-      const sender = this.pc.getSenders().find((x) => x.track?.kind === "video");
-      await sender?.replaceTrack(track);
+      await this.pc.getSenders().find((x) => x.track?.kind === "video")?.replaceTrack(track);
       this.localStream.removeTrack(old);
       this.localStream.addTrack(track);
       this.facing = next;
     } catch (e) {
-      // try to get the previous camera back
       const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: this.facing } } });
       const track = s.getVideoTracks()[0];
       await this.pc.getSenders().find((x) => x.track?.kind === "video")?.replaceTrack(track);
@@ -76,6 +90,20 @@ export class WebRTCService {
       this.localStream.addTrack(track);
       throw e;
     }
+  }
+
+  /** Use a different microphone (e.g. a Bluetooth headset) mid-call. */
+  async switchMic(deviceId: string): Promise<void> {
+    if (!this.localStream) return;
+    const old = this.localStream.getAudioTracks()[0];
+    const wasMuted = old ? !old.enabled : false;
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { ...AUDIO, deviceId: { exact: deviceId } } });
+    const t = s.getAudioTracks()[0];
+    t.contentHint = "speech";
+    t.enabled = !wasMuted;
+    await this.pc.getSenders().find((x) => x.track?.kind === "audio")?.replaceTrack(t);
+    if (old) { old.stop(); this.localStream.removeTrack(old); }
+    this.localStream.addTrack(t);
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
