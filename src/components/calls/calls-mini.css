@@ -1,0 +1,7 @@
+.callov.mini{inset:auto 12px 12px auto;width:270px;height:auto;min-height:0;border-radius:16px;padding:10px;display:block;box-shadow:0 8px 32px #0008}
+.callov.mini .remote{position:relative;inset:auto;height:140px;border-radius:12px}
+.callov.mini .remote.off{height:1px}
+.callov.mini .callmid,.callov.mini .local{display:none}
+.callov.mini .calltop{position:static;background:none;padding:4px 2px}
+.callov.mini .ctrls{position:static;padding:8px 0 0;gap:6px}
+.callov.mini .ctrls button{padding:8px 12px;font-size:13px}

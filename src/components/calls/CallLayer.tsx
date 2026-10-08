@@ -1,16 +1,17 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import type { RealtimeChannel } from "@supabase/supabase-js";
 import { sb } from "@/lib/supabase";
 import { WebRTCService, type CallKind, type CallState } from "@/lib/webrtc/webrtc-service";
 import "./calls.css";
+import "./calls-mini.css";
 
 type Peer = { id: string; name: string; conversationId: string };
+type SigType = "call-start" | "call-accept" | "call-reject" | "call-end" | "offer" | "answer" | "ice-candidate";
 type Sig = {
-  type: "call-start" | "call-accept" | "call-reject" | "call-end" | "offer" | "answer" | "ice-candidate";
-  from: string; callId: string; kind?: CallKind; name?: string; conv?: string;
+  type: SigType; from: string; callId: string; kind?: CallKind; name?: string; conv?: string;
   sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit;
 };
+type SigRow = { call_id: string; from_id: string; type: SigType; payload: Partial<Sig>; created_at: string };
 type Call = { phase: "outgoing" | "incoming" | "connecting" | "connected"; kind: CallKind; peerId: string; peerName: string; conv: string; callId: string; outgoing: boolean; startedAt: number | null };
 type Outcome = "ENDED" | "REJECTED" | "MISSED";
 
@@ -19,16 +20,17 @@ const reason = (e: unknown) =>
   e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "NotFoundError") ? "Allow microphone/camera access to make calls."
     : e instanceof Error ? e.message : "Call failed";
 
+/** Signaling is stored in `call_signals` and delivered via Postgres Changes (reliable, RLS-protected). */
 export function CallLayer({ meId, myName, peer }: { meId: string; myName: string; peer: Peer | null }) {
   const [call, setCall] = useState<Call | null>(null);
   const [muted, setMuted] = useState(false);
   const [camOff, setCamOff] = useState(false);
+  const [mini, setMini] = useState(false);
   const [secs, setSecs] = useState(0);
   const [note, setNote] = useState("");
   const [tick, setTick] = useState(0);
   const cur = useRef<Call | null>(null);
   const svc = useRef<WebRTCService | null>(null);
-  const outs = useRef(new Map<string, Promise<RealtimeChannel>>());
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteRef = useRef<HTMLVideoElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
@@ -37,27 +39,18 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
 
   function update(c: Call | null) { cur.current = c; setCall(c); }
 
-  function getOut(to: string): Promise<RealtimeChannel> {
-    let p = outs.current.get(to);
-    if (!p) {
-      const ch = sb().channel(`calls:${to}`);
-      p = new Promise<RealtimeChannel>((res, rej) => ch.subscribe((s) => {
-        if (s === "SUBSCRIBED") res(ch);
-        else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") { outs.current.delete(to); rej(new Error("Could not reach the other person")); }
-      }));
-      outs.current.set(to, p);
-    }
-    return p;
-  }
   async function send(to: string, m: Omit<Sig, "from">) {
-    const ch = await getOut(to);
-    await ch.send({ type: "broadcast", event: "signal", payload: { ...m, from: meId } });
+    const { type, callId, ...payload } = m;
+    const { error } = await sb().from("call_signals").insert({ call_id: callId, from_id: meId, to_id: to, type, payload });
+    if (error) throw new Error(error.message.includes("row-level") ? "You can't call this person (blocked?)" : "Could not reach the other person");
   }
 
   function cleanup() {
+    const c = cur.current;
     if (timer.current) clearTimeout(timer.current);
     svc.current?.close(); svc.current = null;
-    update(null); setMuted(false); setCamOff(false); setSecs(0);
+    if (c) void sb().from("call_signals").delete().eq("call_id", c.callId).then(() => {});
+    update(null); setMuted(false); setCamOff(false); setMini(false); setSecs(0);
   }
 
   async function log(c: Call, status: Outcome, dur: number) {
@@ -74,9 +67,12 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   function finish(status: Outcome, notify: boolean) {
     const c = cur.current;
     if (!c) return;
-    if (notify) void send(c.peerId, { type: "call-end", callId: c.callId }).catch(() => {});
-    if (c.outgoing) void log(c, status, c.startedAt ? Math.round((Date.now() - c.startedAt) / 1000) : 0).catch(() => {});
-    cleanup();
+    const dur = c.startedAt ? Math.round((Date.now() - c.startedAt) / 1000) : 0;
+    const done = notify ? send(c.peerId, { type: "call-end", callId: c.callId }).catch(() => {}) : Promise.resolve();
+    if (c.outgoing) void log(c, status, dur).catch(() => {});
+    // Let the end signal go out before clearing this call's signal rows
+    void done.then(() => cleanup());
+    svc.current?.close(); svc.current = null; update(null);
   }
 
   function onState(st: CallState) {
@@ -103,7 +99,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
       await send(peer.id, { type: "call-start", callId, kind, name: myName, conv: peer.conversationId });
       timer.current = setTimeout(() => {
         if (cur.current?.callId === callId && !cur.current.startedAt && cur.current.phase === "outgoing") { setNote("No answer"); finish("MISSED", true); }
-      }, 30000);
+      }, 40000);
     } catch (e) { setNote(reason(e)); cleanup(); }
   }
 
@@ -124,8 +120,9 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
 
   function reject() {
     const c = cur.current;
-    if (c) void send(c.peerId, { type: "call-reject", callId: c.callId }).catch(() => {});
-    cleanup();
+    if (!c) return;
+    void send(c.peerId, { type: "call-reject", callId: c.callId }).catch(() => {}).then(() => cleanup());
+    svc.current?.close(); svc.current = null; update(null);
   }
 
   async function handle(m: Sig) {
@@ -133,6 +130,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (m.type === "call-start") {
       if (c) { void send(m.from, { type: "call-reject", callId: m.callId }).catch(() => {}); return; }
       update({ phase: "incoming", kind: m.kind ?? "VOICE", peerId: m.from, peerName: m.name ?? "Someone", conv: m.conv ?? "", callId: m.callId, outgoing: false, startedAt: null });
+      if (document.hidden && "Notification" in window && Notification.permission === "granted") new Notification(`${m.name ?? "Someone"} is calling`, { body: "Open Talkie to answer" });
       return;
     }
     if (!c || c.callId !== m.callId) return;
@@ -160,18 +158,33 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   }
   handlerRef.current = (m) => void handle(m);
 
-  // Incoming signaling inbox
+  // Incoming signals (rows addressed to me)
   useEffect(() => {
-    const inbox = sb().channel(`calls:${meId}`)
-      .on("broadcast", { event: "signal" }, ({ payload }) => handlerRef.current(payload as Sig)).subscribe();
-    const map = outs.current;
-    return () => {
-      void sb().removeChannel(inbox);
-      map.forEach((p) => void p.then((ch) => sb().removeChannel(ch)).catch(() => {}));
-      map.clear();
-      svc.current?.close(); svc.current = null;
-    };
+    if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
+    const ch = sb().channel(`signals:${meId}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "call_signals", filter: `to_id=eq.${meId}` }, (p) => {
+        const r = p.new as SigRow;
+        if (Date.now() - new Date(r.created_at).getTime() > 90000) return; // ignore stale
+        handlerRef.current({ ...r.payload, type: r.type, from: r.from_id, callId: r.call_id });
+      }).subscribe();
+    return () => { void sb().removeChannel(ch); svc.current?.close(); svc.current = null; };
   }, [meId]);
+
+  // Ringtone while a call is incoming
+  useEffect(() => {
+    if (call?.phase !== "incoming") return;
+    let ctx: AudioContext | null = null;
+    try { ctx = new AudioContext(); } catch { ctx = null; }
+    const beep = () => {
+      if (!ctx) return;
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.frequency.value = 480; g.gain.value = 0.15; o.connect(g); g.connect(ctx.destination);
+      o.start(); o.stop(ctx.currentTime + 0.5);
+    };
+    beep();
+    const id = setInterval(beep, 1600);
+    return () => { clearInterval(id); void ctx?.close(); };
+  }, [call?.phase]);
 
   // Attach media streams
   useEffect(() => {
@@ -180,7 +193,6 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     if (localRef.current) localRef.current.srcObject = svc.current.localStream;
   }, [call?.phase, tick]);
 
-  // Duration timer
   useEffect(() => {
     const start = call?.startedAt;
     if (!start) return;
@@ -205,7 +217,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
         </div>
       )}
       {call && (
-        <div className="callov" ref={ovRef} role="dialog" aria-label="Call">
+        <div className={`callov${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
           <video ref={remoteRef} autoPlay playsInline className={call.kind === "VIDEO" ? "remote" : "remote off"} />
           <div className="calltop"><strong>{call.peerName}</strong><span>{status}</span></div>
           {!(call.kind === "VIDEO" && call.phase === "connected") && (
@@ -220,9 +232,10 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
               </>
             ) : (
               <>
+                <button onClick={() => setMini(!mini)}>{mini ? "Expand" : "Minimize"}</button>
                 <button onClick={() => { svc.current?.setMuted(!muted); setMuted(!muted); }}>{muted ? "Unmute" : "Mute"}</button>
                 {call.kind === "VIDEO" && <button onClick={() => { svc.current?.setCameraOn(camOff); setCamOff(!camOff); }}>{camOff ? "Camera on" : "Camera off"}</button>}
-                {call.kind === "VIDEO" && <button onClick={() => void ovRef.current?.requestFullscreen()}>Fullscreen</button>}
+                {call.kind === "VIDEO" && !mini && <button onClick={() => void ovRef.current?.requestFullscreen()}>Fullscreen</button>}
                 <button className="rej" onClick={() => finish(call.startedAt ? "ENDED" : "MISSED", true)}>End</button>
               </>
             )}
