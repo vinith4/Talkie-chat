@@ -17,6 +17,7 @@ type Sig = {
 type SigRow = { call_id: string; from_id: string; type: SigType; payload: Partial<Sig>; created_at: string };
 type Call = { phase: "outgoing" | "incoming" | "connecting" | "connected"; kind: CallKind; peerId: string; peerName: string; conv: string; callId: string; outgoing: boolean; startedAt: number | null };
 type Outcome = "ENDED" | "REJECTED" | "MISSED";
+type Corner = "tl" | "tr" | "bl" | "br";
 type SinkEl = HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -47,15 +48,28 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const [note, setNote] = useState("");
   const [tick, setTick] = useState(0);
   const [needAlerts, setNeedAlerts] = useState(false);
+  const [corner, setCorner] = useState<Corner>("tr");
+  const [dragXY, setDragXY] = useState<{ x: number; y: number } | null>(null);
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  const [front, setFront] = useState(true);
   const cur = useRef<Call | null>(null);
   const svc = useRef<WebRTCService | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteRef = useRef<HTMLVideoElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
   const ovRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null);
   const handlerRef = useRef<(m: Sig) => void>(() => {});
   const actRef = useRef<(a: string) => void>(() => {});
   const startRef = useRef<(k: CallKind, p?: Peer | null) => void>(() => {});
+
+  // Self-preview size and position adapt to the screen (portrait / landscape / desktop)
+  const land = box.w > box.h;
+  const sw = land ? Math.min(220, box.w * 0.22) : Math.min(150, Math.max(90, box.w * 0.28));
+  const sh = land ? sw * 0.62 : sw * 1.4;
+  const cx = corner.endsWith("l") ? 12 : Math.max(12, box.w - sw - 12);
+  const cy = corner.startsWith("t") ? 76 : Math.max(76, box.h - sh - 140);
+  const self = { x: dragXY?.x ?? cx, y: dragXY?.y ?? cy, w: sw, h: sh };
 
   function update(c: Call | null) { cur.current = c; setCall(c); }
 
@@ -70,6 +84,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     svc.current?.close(); svc.current = null;
     if (callId) void sb().from("call_signals").delete().eq("call_id", callId).then(() => {});
     update(null); setMuted(false); setCamOff(false); setMini(false); setSheet(null); setOutId(""); setInId(""); setSecs(0);
+    setCorner("tr"); setDragXY(null); setFront(true);
   }
 
   async function log(c: Call, status: Outcome, dur: number) {
@@ -153,8 +168,32 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
 
   function toggleMute() { svc.current?.setMuted(!muted); setMuted(!muted); }
   function toggleCam() { svc.current?.setCameraOn(camOff); setCamOff(!camOff); }
-  function flip() { svc.current?.switchCamera().then(() => setTick((t) => t + 1)).catch((e) => setNote(reason(e))); }
+  function flip() { svc.current?.switchCamera().then(() => { setFront((f) => !f); setTick((t) => t + 1); }).catch((e) => setNote(reason(e))); }
   function endCall() { const c = cur.current; if (c) finish(c.startedAt ? "ENDED" : "MISSED", true); }
+
+  // Draggable self-preview: drag anywhere, snaps to the nearest corner on release
+  function onSelfDown(e: React.PointerEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    dragRef.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function onSelfMove(e: React.PointerEvent<HTMLDivElement>) {
+    const d = dragRef.current;
+    const ov = ovRef.current;
+    if (!d || !ov) return;
+    const b = ov.getBoundingClientRect();
+    const x = Math.min(Math.max(e.clientX - d.dx - b.left, 6), Math.max(6, b.width - self.w - 6));
+    const y = Math.min(Math.max(e.clientY - d.dy - b.top, 6), Math.max(6, b.height - self.h - 6));
+    setDragXY({ x, y });
+  }
+  function onSelfUp() {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    const mx = self.x + self.w / 2;
+    const my = self.y + self.h / 2;
+    setCorner(`${my < box.h / 2 ? "t" : "b"}${mx < box.w / 2 ? "l" : "r"}` as Corner);
+    setDragXY(null);
+  }
 
   async function loadDevs() {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -280,6 +319,18 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return undefined;
   }, [call?.phase]);
 
+  // Track the call screen size so layout adapts to rotation / resizing
+  const open = !!call;
+  useEffect(() => {
+    const el = ovRef.current;
+    if (!open || !el) return;
+    const measure = () => setBox({ w: el.clientWidth, h: el.clientHeight });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [open, mini]);
+
   // Audio devices: keep the list fresh and auto-route to a Bluetooth headset when one appears
   useEffect(() => {
     if (!call || call.phase === "incoming" || !navigator.mediaDevices) return;
@@ -376,7 +427,16 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
             <p>{status}</p>
             {showAvatar && <div className="cavatar">{(call.peerName[0] ?? "?").toUpperCase()}</div>}
           </div>
-          {isVideo && call.phase !== "incoming" && <video ref={localRef} autoPlay playsInline muted className="local" />}
+          {isVideo && call.phase !== "incoming" && (
+            <div
+              className={`selfwrap${dragXY ? " drag" : ""}`}
+              style={{ left: self.x, top: self.y, width: self.w, height: self.h }}
+              onPointerDown={onSelfDown} onPointerMove={onSelfMove} onPointerUp={onSelfUp} onPointerCancel={onSelfUp}
+              role="group" aria-label="Your camera preview. Drag to move it."
+            >
+              <video ref={localRef} autoPlay playsInline muted style={{ transform: front ? "scaleX(-1)" : undefined }} />
+            </div>
+          )}
 
           {call.phase === "incoming" ? (
             <div className="inc">
@@ -408,6 +468,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
                   <button onClick={() => { setMini(true); setSheet(null); }}>Minimize call</button>
                   {isVideo && <button onClick={() => { void ovRef.current?.requestFullscreen(); setSheet(null); }}>Fullscreen</button>}
                   {isVideo && <button onClick={() => { flip(); setSheet(null); }}>Flip camera</button>}
+                  {isVideo && <button onClick={() => { setCorner("tr"); setSheet(null); }}>Reset self-view position</button>}
                 </>
               ) : (
                 <>
