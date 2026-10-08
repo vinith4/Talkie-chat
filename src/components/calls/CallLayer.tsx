@@ -2,9 +2,11 @@
 import { useEffect, useRef, useState } from "react";
 import { sb } from "@/lib/supabase";
 import { WebRTCService, getIceServers, type CallKind, type CallState } from "@/lib/webrtc/webrtc-service";
-import { chime, startRing } from "@/lib/webrtc/sounds";
+import { audioRunning, chime, startRing, unlockAudio } from "@/lib/webrtc/sounds";
+import { enablePush, pushSupported, registerWorker } from "@/lib/push";
 import "./calls.css";
 import "./calls-mini.css";
+import "./calls-extra.css";
 
 type Peer = { id: string; name: string; conversationId: string };
 type SigType = "call-start" | "call-accept" | "call-reject" | "call-end" | "offer" | "answer" | "ice-candidate";
@@ -31,6 +33,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const [secs, setSecs] = useState(0);
   const [note, setNote] = useState("");
   const [tick, setTick] = useState(0);
+  const [needAlerts, setNeedAlerts] = useState(false);
   const cur = useRef<Call | null>(null);
   const svc = useRef<WebRTCService | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -38,6 +41,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const localRef = useRef<HTMLVideoElement>(null);
   const ovRef = useRef<HTMLDivElement>(null);
   const handlerRef = useRef<(m: Sig) => void>(() => {});
+  const actRef = useRef<(a: string) => void>(() => {});
 
   function update(c: Call | null) { cur.current = c; setCall(c); }
 
@@ -94,6 +98,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
 
   async function startCall(kind: CallKind) {
     if (!peer || cur.current) return;
+    unlockAudio();
     const callId = crypto.randomUUID();
     try {
       const s = makeService(peer.id, callId);
@@ -110,6 +115,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   async function accept() {
     const c = cur.current;
     if (!c || c.phase !== "incoming") return;
+    unlockAudio();
     try {
       const s = makeService(c.peerId, c.callId);
       update({ ...c, phase: "connecting" });
@@ -129,12 +135,13 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     cleanup();
   }
 
+  function toggleMute() { svc.current?.setMuted(!muted); setMuted(!muted); }
+
   async function handle(m: Sig) {
     const c = cur.current;
     if (m.type === "call-start") {
       if (c) { void send(m.from, { type: "call-reject", callId: m.callId }).catch(() => {}); return; }
       update({ phase: "incoming", kind: m.kind ?? "VOICE", peerId: m.from, peerName: m.name ?? "Someone", conv: m.conv ?? "", callId: m.callId, outgoing: false, startedAt: null });
-      if (document.hidden && "Notification" in window && Notification.permission === "granted") new Notification(`${m.name ?? "Someone"} is calling`, { body: "Open Talkie to answer" });
       return;
     }
     if (!c || c.callId !== m.callId) return;
@@ -161,25 +168,97 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     } catch (e) { setNote(reason(e)); finish("ENDED", true); }
   }
   handlerRef.current = (m) => void handle(m);
+  actRef.current = (a) => {
+    const c = cur.current;
+    if (!c) return;
+    if (a === "accept" && c.phase === "incoming") void accept();
+    else if (a === "decline" && c.phase === "incoming") reject();
+    else if (a === "mute" && c.phase !== "incoming") toggleMute();
+    else if (a === "end" && c.phase !== "incoming") finish(c.startedAt ? "ENDED" : "MISSED", true);
+  };
 
-  // Incoming signals (rows addressed to me)
+  // Incoming signals (rows addressed to me) + catch-up for a call that rang while the app was closed
   useEffect(() => {
-    if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
     const ch = sb().channel(`signals:${meId}`)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "call_signals", filter: `to_id=eq.${meId}` }, (p) => {
         const r = p.new as SigRow;
         if (Date.now() - new Date(r.created_at).getTime() > 90000) return; // ignore stale
         handlerRef.current({ ...r.payload, type: r.type, from: r.from_id, callId: r.call_id });
-      }).subscribe();
+      }).subscribe((s) => {
+        if (s !== "SUBSCRIBED") return;
+        const since = new Date(Date.now() - 45000).toISOString();
+        void sb().from("call_signals").select("call_id,from_id,type,payload,created_at").eq("to_id", meId).gte("created_at", since).order("created_at", { ascending: true })
+          .then(({ data }) => {
+            const rows = (data ?? []) as SigRow[];
+            const ended = new Set(rows.filter((r) => r.type === "call-end").map((r) => r.call_id));
+            const start = [...rows].reverse().find((r) => r.type === "call-start" && !ended.has(r.call_id));
+            if (!start || cur.current) return;
+            handlerRef.current({ ...start.payload, type: start.type, from: start.from_id, callId: start.call_id });
+            if (new URLSearchParams(window.location.search).get("answer")) setTimeout(() => actRef.current("accept"), 400);
+          });
+      });
     return () => { void sb().removeChannel(ch); svc.current?.close(); svc.current = null; };
   }, [meId]);
 
+  // Background alerts: register worker, silently re-subscribe if already allowed
+  useEffect(() => {
+    if (!pushSupported()) return;
+    void registerWorker().catch(() => {});
+    if (Notification.permission === "granted") void enablePush(false);
+    else if (Notification.permission === "default") setNeedAlerts(true);
+  }, [meId]);
+
+  // Notification buttons (Answer / Decline / Mute / End) arrive from the service worker
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const h = (e: MessageEvent) => {
+      const m = e.data as { type?: string; action?: string } | null;
+      if (m?.type === "notif-action" && m.action) actRef.current(m.action);
+    };
+    navigator.serviceWorker.addEventListener("message", h);
+    return () => navigator.serviceWorker.removeEventListener("message", h);
+  }, []);
+
+  // Browsers only allow sound after a tap: unlock on the first interaction
+  useEffect(() => {
+    const un = () => unlockAudio();
+    window.addEventListener("pointerdown", un);
+    window.addEventListener("keydown", un);
+    return () => { window.removeEventListener("pointerdown", un); window.removeEventListener("keydown", un); };
+  }, []);
+
   // Phone-style sounds: ringtone for the callee, ringback for the caller
   useEffect(() => {
-    if (call?.phase === "incoming") return startRing("ringtone");
+    if (call?.phase === "incoming") {
+      if (!audioRunning()) setNote("Tap anywhere on the screen to hear the ringtone");
+      return startRing("ringtone");
+    }
     if (call?.phase === "outgoing") return startRing("ringback");
     return undefined;
   }, [call?.phase]);
+
+  // Ongoing-call notification with Mute / End buttons while the app is in the background
+  useEffect(() => {
+    if (!call || call.phase !== "connected" || !("serviceWorker" in navigator) || !("Notification" in window)) return;
+    const title = `${call.kind === "VIDEO" ? "Video" : "Voice"} call · ${call.peerName}`;
+    const show = async () => {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg || Notification.permission !== "granted") return;
+      await reg.showNotification(title, {
+        tag: "talkie-ongoing", body: muted ? "Microphone muted · tap to return" : "Call in progress · tap to return",
+        requireInteraction: true, silent: true, icon: "/icon.svg", badge: "/icon.svg",
+        actions: [{ action: "mute", title: muted ? "Unmute" : "Mute" }, { action: "end", title: "End call" }],
+      } as NotificationOptions);
+    };
+    const clear = async () => {
+      const reg = await navigator.serviceWorker.getRegistration();
+      (await reg?.getNotifications({ tag: "talkie-ongoing" }))?.forEach((n) => n.close());
+    };
+    const onVis = () => { if (document.hidden) void show(); else void clear(); };
+    document.addEventListener("visibilitychange", onVis);
+    if (document.hidden) void show();
+    return () => { document.removeEventListener("visibilitychange", onVis); void clear(); };
+  }, [call?.phase, call?.peerName, call?.kind, muted]);
 
   // Attach media streams (re-run whenever a remote track arrives)
   useEffect(() => {
@@ -218,6 +297,9 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
           <button className="ghost" onClick={() => startCall("VIDEO")} aria-label="Video call">📹</button>
         </div>
       )}
+      {needAlerts && !call && (
+        <button className="ghost alertbtn" onClick={async () => { const r = await enablePush(true); if (r === "ok") setNeedAlerts(false); else setNote(r); }}>🔔 Turn on call alerts</button>
+      )}
       {call && (
         <div className={`callov${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
           <video ref={remoteRef} autoPlay playsInline className={call.kind === "VIDEO" ? "remote" : "remote off"} />
@@ -235,7 +317,8 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
             ) : (
               <>
                 <button onClick={() => setMini(!mini)}>{mini ? "Expand" : "Minimize"}</button>
-                <button onClick={() => { svc.current?.setMuted(!muted); setMuted(!muted); }}>{muted ? "Unmute" : "Mute"}</button>
+                <button onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</button>
+                {call.kind === "VIDEO" && <button onClick={() => { svc.current?.switchCamera().then(() => setTick((t) => t + 1)).catch((e) => setNote(reason(e))); }}>Flip camera</button>}
                 {call.kind === "VIDEO" && <button onClick={() => { svc.current?.setCameraOn(camOff); setCamOff(!camOff); }}>{camOff ? "Camera on" : "Camera off"}</button>}
                 {call.kind === "VIDEO" && !mini && <button onClick={() => void ovRef.current?.requestFullscreen()}>Fullscreen</button>}
                 <button className="rej" onClick={() => finish(call.startedAt ? "ENDED" : "MISSED", true)}>End</button>

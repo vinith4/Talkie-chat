@@ -4,13 +4,27 @@ function ac(): AudioContext | null {
   if (!ctx) {
     try { ctx = new AudioContext(); } catch { return null; }
   }
-  if (ctx.state === "suspended") void ctx.resume();
+  if (ctx.state === "suspended") void ctx.resume().catch(() => {});
   return ctx;
 }
 
-function tone(freqs: number[], start: number, dur: number, vol = 0.12) {
+export function audioRunning(): boolean { return ac()?.state === "running"; }
+
+/** Browsers only allow sound after a tap/click. Call this from any user gesture. */
+export function unlockAudio() {
   const c = ac();
-  if (!c) return;
+  if (!c || c.state === "running") return;
+  try {
+    const s = c.createBufferSource();
+    s.buffer = c.createBuffer(1, 1, 22050);
+    s.connect(c.destination);
+    s.start(0);
+  } catch { /* ignore */ }
+}
+
+function tone(freqs: number[], start: number, dur: number, vol = 0.18) {
+  const c = ac();
+  if (!c || c.state !== "running") return;
   const t = c.currentTime + start;
   const g = c.createGain();
   g.gain.setValueAtTime(0, t);
@@ -37,7 +51,9 @@ export function startRing(kind: "ringtone" | "ringback"): () => void {
       tone([440, 480], 0, 1.5);
     }
   };
-  cycle();
+  const c = ac();
+  if (c && c.state === "suspended") void c.resume().then(cycle).catch(() => {});
+  else cycle();
   const id = setInterval(cycle, kind === "ringtone" ? 3000 : 4000);
   return () => { clearInterval(id); try { navigator.vibrate?.(0); } catch { /* ignore */ } };
 }

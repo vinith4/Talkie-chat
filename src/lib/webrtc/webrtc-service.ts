@@ -20,6 +20,7 @@ export function getIceServers(): RTCIceServer[] {
 export class WebRTCService {
   private pc: RTCPeerConnection;
   private pending: RTCIceCandidateInit[] = [];
+  private facing: "user" | "environment" = "user";
   localStream: MediaStream | null = null;
   readonly remoteStream = new MediaStream();
 
@@ -50,6 +51,31 @@ export class WebRTCService {
     });
     this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream!));
     return this.localStream;
+  }
+
+  /** Switch between front and back camera without renegotiating the call. */
+  async switchCamera(): Promise<void> {
+    const old = this.localStream?.getVideoTracks()[0];
+    if (!this.localStream || !old) return;
+    const next = this.facing === "user" ? "environment" : "user";
+    old.stop(); // phones often allow only one camera at a time
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: next }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+      const track = s.getVideoTracks()[0];
+      const sender = this.pc.getSenders().find((x) => x.track?.kind === "video");
+      await sender?.replaceTrack(track);
+      this.localStream.removeTrack(old);
+      this.localStream.addTrack(track);
+      this.facing = next;
+    } catch (e) {
+      // try to get the previous camera back
+      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: this.facing } } });
+      const track = s.getVideoTracks()[0];
+      await this.pc.getSenders().find((x) => x.track?.kind === "video")?.replaceTrack(track);
+      this.localStream.removeTrack(old);
+      this.localStream.addTrack(track);
+      throw e;
+    }
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
