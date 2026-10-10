@@ -6,6 +6,7 @@ import { sb } from "@/lib/supabase";
 import { CallLayer } from "@/components/calls/CallLayer";
 import { CallsList } from "@/components/calls/CallsList";
 import { ProfilePanel } from "@/components/ProfilePanel";
+import { InfoSheet } from "@/components/InfoSheet";
 import { Avatar } from "@/components/Avatar";
 import { Ticks, type TickState } from "@/components/Ticks";
 import "./chat.css";
@@ -21,6 +22,9 @@ type PresenceMeta = { typing?: boolean; name?: string };
 
 const EMOJIS = ["👍", "❤️", "😂", "😮", "🙏"];
 
+/** supabase-js queries only run when awaited/thenned: this makes fire-and-forget calls actually execute. */
+const fire = (q: PromiseLike<unknown>) => { void Promise.resolve(q).catch(() => {}); };
+
 export default function ChatPage() {
   const router = useRouter();
   const [tab, setTab] = useState<"chats" | "calls" | "profile">("chats");
@@ -28,6 +32,8 @@ export default function ChatPage() {
   const [myName, setMyName] = useState("Someone");
   const [convs, setConvs] = useState<Conv[]>([]);
   const [active, setActive] = useState<Conv | null>(null);
+  const [info, setInfo] = useState(false);
+  const [vis, setVis] = useState(true);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [pins, setPins] = useState<string[]>([]);
@@ -69,6 +75,14 @@ export default function ChatPage() {
     setConvs([...seen.values()]);
   }, []);
 
+  // Is the app actually in front of the user? (blue ticks only when messages are really seen)
+  useEffect(() => {
+    const h = () => setVis(document.visibilityState === "visible");
+    h();
+    document.addEventListener("visibilitychange", h);
+    return () => document.removeEventListener("visibilitychange", h);
+  }, []);
+
   // Session + profile
   useEffect(() => {
     sb().auth.getSession().then(async ({ data }) => {
@@ -78,7 +92,7 @@ export default function ChatPage() {
       const p = await sb().from("profiles").select("display_name").eq("id", uid).single();
       if (p.data) setMyName((p.data as { display_name: string }).display_name);
       await loadConvs(uid);
-      void sb().rpc("mark_delivered"); // everything waiting for me counts as delivered now
+      fire(sb().rpc("mark_delivered")); // everything waiting for me counts as delivered now
       setLoading(false);
     });
     const { data: sub } = sb().auth.onAuthStateChange((_e, s) => { if (!s) router.replace("/"); });
@@ -96,7 +110,7 @@ export default function ChatPage() {
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (p) => {
         if ((p.new as Msg).sender_id === meId) return;
         if (delivTimer.current) clearTimeout(delivTimer.current);
-        delivTimer.current = setTimeout(() => void sb().rpc("mark_delivered"), 400);
+        delivTimer.current = setTimeout(() => fire(sb().rpc("mark_delivered")), 400);
       })
       .subscribe();
     return () => { void sb().removeChannel(pres); void sb().removeChannel(mine); };
@@ -107,7 +121,7 @@ export default function ChatPage() {
     if (!active || !meId) return;
     const cid = active.id;
     let cancelled = false;
-    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null);
+    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null); setInfo(false);
     (async () => {
       const m = await sb().from("messages").select("*").eq("conversation_id", cid).order("created_at", { ascending: false }).limit(50);
       if (cancelled) return;
@@ -159,15 +173,15 @@ export default function ChatPage() {
 
   useEffect(() => { bottom.current?.scrollIntoView({ block: "end" }); }, [msgs.length, typers.length]);
 
-  // Read receipts: mark conversation read up to newest message (one write per new message)
+  // Read receipts: mark the conversation read up to the newest message, only while the app is in front
   useEffect(() => {
-    if (!active || !meId || !msgs.length) return;
+    if (!active || !meId || !msgs.length || !vis) return;
     const newest = msgs[msgs.length - 1].created_at;
     const key = `${active.id}:${newest}`;
     if (readMark.current === key) return;
     readMark.current = key;
-    void sb().from("conversation_members").update({ last_read_at: newest }).eq("conversation_id", active.id).eq("user_id", meId);
-  }, [msgs, active, meId]);
+    fire(sb().from("conversation_members").update({ last_read_at: newest }).eq("conversation_id", active.id).eq("user_id", meId));
+  }, [msgs, active, meId, vis]);
 
   // Debounced user search
   useEffect(() => {
@@ -326,8 +340,10 @@ export default function ChatPage() {
           <>
             <header>
               <button className="ghost back" onClick={() => setActive(null)} aria-label="Back">←</button>
-              {active.isGroup ? <span className="avatar">#</span> : <Avatar userId={active.otherId} name={active.title} />}
-              <span className="top"><span><strong>{active.title}</strong><small>{active.isGroup ? `${members.length} members` : active.otherId && online.has(active.otherId) ? "Online" : "Offline"}</small></span></span>
+              <button className="hdrbtn top" onClick={() => setInfo(true)} aria-label={active.isGroup ? "Group info" : `View ${active.title}'s profile`}>
+                {active.isGroup ? <span className="avatar">#</span> : <Avatar userId={active.otherId} name={active.title} />}
+                <span><strong>{active.title}</strong><small>{active.isGroup ? `${members.length} members` : active.otherId && online.has(active.otherId) ? "Online" : "Offline"}</small></span>
+              </button>
               {active.isGroup && <button className="ghost" onClick={leaveGroup}>Leave</button>}
             </header>
             {lastPinned && <div className="pinbar">📌 <button onClick={() => jump(lastPinned.id)}>{lastPinned.content}</button><span className="muted">{pins.length} pinned</span></div>}
@@ -379,6 +395,12 @@ export default function ChatPage() {
         )}
         {error && <div className="err" role="alert" style={{ padding: 8 }} onClick={() => setError("")}>{error}</div>}
       </main>
+      {info && active && meId && (active.isGroup || active.otherId) && (
+        <InfoSheet
+          meId={meId} online={online} onClose={() => setInfo(false)}
+          target={active.isGroup ? { kind: "group", name: active.title, members: members.map((m) => ({ id: m.user_id, name: m.name })) } : { kind: "user", id: active.otherId!, name: active.title }}
+        />
+      )}
       {meId && <CallLayer meId={meId} myName={myName} peer={active && !active.isGroup && active.otherId ? { id: active.otherId, name: active.title, conversationId: active.id } : null} />}
     </div>
   );

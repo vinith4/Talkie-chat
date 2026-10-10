@@ -29,10 +29,11 @@ export function ProfilePanel({ meId, onNameChange }: { meId: string; onNameChang
   const file = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    void Promise.resolve(sb().from("profiles").select("display_name,username,bio,email,avatar_url").eq("id", meId).single()).then(({ data, error }) => {
+    void Promise.resolve(sb().from("profiles").select("display_name,username,bio,avatar_url").eq("id", meId).single()).then(async ({ data, error }) => {
       if (error || !data) { setErr(error?.message ?? "Could not load your profile"); setLoading(false); return; }
-      const p = data as { display_name: string; username: string; bio: string | null; email: string | null; avatar_url: string | null };
-      setName(p.display_name); setUsername(p.username); setBio(p.bio ?? ""); setEmail(p.email ?? ""); setHasPhoto(!!p.avatar_url);
+      const p = data as { display_name: string; username: string; bio: string | null; avatar_url: string | null };
+      const { data: u } = await sb().auth.getUser();
+      setName(p.display_name); setUsername(p.username); setBio(p.bio ?? ""); setEmail(u.user?.email ?? ""); setHasPhoto(!!p.avatar_url);
       setLoading(false);
     });
   }, [meId]);
@@ -45,6 +46,7 @@ export function ProfilePanel({ meId, onNameChange }: { meId: string; onNameChang
     try {
       if (!f.type.startsWith("image/")) throw new Error("Please choose an image file.");
       const url = await toSquareDataUrl(f);
+      // The new photo replaces the old one in the same profile row: no old copies are kept.
       const { error } = await sb().from("profiles").update({ avatar_url: url }).eq("id", meId);
       if (error) throw new Error(error.message);
       setCachedAvatar(meId, url); setHasPhoto(true); setMsg("Photo updated");
@@ -86,7 +88,7 @@ export function ProfilePanel({ meId, onNameChange }: { meId: string; onNameChang
       <label>Name<input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} /></label>
       <label>Username<input value={username} onChange={(e) => setUsername(e.target.value)} maxLength={24} autoCapitalize="none" /></label>
       <label>About<textarea value={bio} onChange={(e) => setBio(e.target.value)} maxLength={140} rows={2} placeholder="Hey there! I am using Talkie" /></label>
-      <label>Email<input value={email} disabled /></label>
+      <label>Email (only you can see this)<input value={email} disabled /></label>
       {err && <div className="err" role="alert">{err}</div>}
       {msg && <div className="ok" role="status">{msg}</div>}
       <button disabled={busy}>Save changes</button>
