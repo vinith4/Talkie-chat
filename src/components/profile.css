@@ -1,0 +1,8 @@
+.prof{padding:22px 16px;display:grid;gap:16px}
+.pavwrap{position:relative;width:128px;height:128px;margin:0 auto}
+.pavatar{width:128px;height:128px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:52px;font-weight:600}
+.camfab{position:absolute;right:0;bottom:0;width:40px;height:40px;border-radius:50%;padding:0;display:grid;place-items:center;border:3px solid var(--card);font-size:18px}
+.prof label{font-size:12px;color:var(--muted);display:grid;gap:4px}
+.prof textarea{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:10px 12px;width:100%;font:inherit;resize:none}
+.prof .ok{color:#16a34a;font-size:14px}
+.prof .row2{display:flex;gap:8px;justify-content:center}

@@ -22,7 +22,13 @@ function load(id: string): Promise<string | null> {
   return p;
 }
 
-/** Profile photo (Gravatar / Google) with a letter fallback when the email has no photo. */
+/** Call after the user changes their own photo so every avatar updates instantly. */
+export function setCachedAvatar(id: string, url: string | null) {
+  cache.set(id, url);
+  window.dispatchEvent(new CustomEvent("talkie:avatar", { detail: id }));
+}
+
+/** Profile photo (uploaded / Gravatar / Google) with a letter fallback. */
 export function Avatar({ userId, name, className = "avatar" }: { userId?: string | null; name: string; className?: string }) {
   const [url, setUrl] = useState<string | null>(userId && cache.has(userId) ? (cache.get(userId) ?? null) : null);
   const [bad, setBad] = useState(false);
@@ -32,7 +38,9 @@ export function Avatar({ userId, name, className = "avatar" }: { userId?: string
     if (!userId) { setUrl(null); return; }
     let live = true;
     void load(userId).then((u) => { if (live) setUrl(u); });
-    return () => { live = false; };
+    const h = (e: Event) => { if ((e as CustomEvent<string>).detail === userId) { setBad(false); setUrl(cache.get(userId) ?? null); } };
+    window.addEventListener("talkie:avatar", h);
+    return () => { live = false; window.removeEventListener("talkie:avatar", h); };
   }, [userId]);
 
   return (

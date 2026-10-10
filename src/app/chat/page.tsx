@@ -5,7 +5,9 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { sb } from "@/lib/supabase";
 import { CallLayer } from "@/components/calls/CallLayer";
 import { CallsList } from "@/components/calls/CallsList";
+import { ProfilePanel } from "@/components/ProfilePanel";
 import { Avatar } from "@/components/Avatar";
+import { Ticks, type TickState } from "@/components/Ticks";
 import "./chat.css";
 import "./tabs.css";
 
@@ -13,7 +15,7 @@ type Msg = { id: string; conversation_id: string; sender_id: string; content: st
 type Prof = { id: string; display_name: string; username: string };
 type Conv = { id: string; title: string; isGroup: boolean; otherId: string | null };
 type Reaction = { message_id: string; user_id: string; emoji: string };
-type Member = { user_id: string; last_read_at: string; name: string };
+type Member = { user_id: string; last_read_at: string; delivered_at: string; name: string };
 type MemberRow = { conversation_id: string; user_id: string; conversations: { type: string; name: string | null } | null; profiles: { display_name: string } | null };
 type PresenceMeta = { typing?: boolean; name?: string };
 
@@ -21,7 +23,7 @@ const EMOJIS = ["👍", "❤️", "😂", "😮", "🙏"];
 
 export default function ChatPage() {
   const router = useRouter();
-  const [tab, setTab] = useState<"chats" | "calls">("chats");
+  const [tab, setTab] = useState<"chats" | "calls" | "profile">("chats");
   const [meId, setMeId] = useState<string | null>(null);
   const [myName, setMyName] = useState("Someone");
   const [convs, setConvs] = useState<Conv[]>([]);
@@ -46,6 +48,7 @@ export default function ChatPage() {
   const bottom = useRef<HTMLDivElement>(null);
   const room = useRef<RealtimeChannel | null>(null);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const delivTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readMark = useRef("");
 
   const loadConvs = useCallback(async (uid: string) => {
@@ -75,13 +78,14 @@ export default function ChatPage() {
       const p = await sb().from("profiles").select("display_name").eq("id", uid).single();
       if (p.data) setMyName((p.data as { display_name: string }).display_name);
       await loadConvs(uid);
+      void sb().rpc("mark_delivered"); // everything waiting for me counts as delivered now
       setLoading(false);
     });
     const { data: sub } = sb().auth.onAuthStateChange((_e, s) => { if (!s) router.replace("/"); });
     return () => sub.subscription.unsubscribe();
   }, [router, loadConvs]);
 
-  // Global presence (who is online) + new-conversation notifications
+  // Global presence (who is online) + new-conversation alerts + delivery receipts for incoming messages
   useEffect(() => {
     if (!meId) return;
     const pres = sb().channel("online", { config: { presence: { key: meId } } });
@@ -89,6 +93,11 @@ export default function ChatPage() {
       .subscribe((s) => { if (s === "SUBSCRIBED") void pres.track({ at: Date.now() }); });
     const mine = sb().channel(`mine:${meId}`)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${meId}` }, () => void loadConvs(meId))
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (p) => {
+        if ((p.new as Msg).sender_id === meId) return;
+        if (delivTimer.current) clearTimeout(delivTimer.current);
+        delivTimer.current = setTimeout(() => void sb().rpc("mark_delivered"), 400);
+      })
       .subscribe();
     return () => { void sb().removeChannel(pres); void sb().removeChannel(mine); };
   }, [meId, loadConvs]);
@@ -108,13 +117,13 @@ export default function ChatPage() {
       const [r, p, mem] = await Promise.all([
         sb().from("message_reactions").select("message_id,user_id,emoji").in("message_id", list.map((x) => x.id)),
         sb().from("pinned_messages").select("message_id").eq("conversation_id", cid),
-        sb().from("conversation_members").select("user_id,last_read_at,profiles(display_name)").eq("conversation_id", cid),
+        sb().from("conversation_members").select("user_id,last_read_at,last_delivered_at,profiles(display_name)").eq("conversation_id", cid),
       ]);
       if (cancelled) return;
       setReactions((r.data ?? []) as Reaction[]);
       setPins(((p.data ?? []) as { message_id: string }[]).map((x) => x.message_id));
-      setMembers(((mem.data ?? []) as unknown as { user_id: string; last_read_at: string; profiles: { display_name: string } | null }[])
-        .map((x) => ({ user_id: x.user_id, last_read_at: x.last_read_at, name: x.profiles?.display_name ?? "Unknown" })));
+      setMembers(((mem.data ?? []) as unknown as { user_id: string; last_read_at: string; last_delivered_at: string; profiles: { display_name: string } | null }[])
+        .map((x) => ({ user_id: x.user_id, last_read_at: x.last_read_at, delivered_at: x.last_delivered_at, name: x.profiles?.display_name ?? "Unknown" })));
     })();
 
     const ch = sb().channel(`room:${cid}`, { config: { presence: { key: meId } } })
@@ -136,8 +145,8 @@ export default function ChatPage() {
         else if (p.eventType === "DELETE") { const id = (p.old as { message_id: string }).message_id; setPins((c) => c.filter((x) => x !== id)); }
       })
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "conversation_members", filter: `conversation_id=eq.${cid}` }, (p) => {
-        const row = p.new as { user_id: string; last_read_at: string };
-        setMembers((cur) => cur.map((x) => (x.user_id === row.user_id ? { ...x, last_read_at: row.last_read_at } : x)));
+        const row = p.new as { user_id: string; last_read_at: string; last_delivered_at: string };
+        setMembers((cur) => cur.map((x) => (x.user_id === row.user_id ? { ...x, last_read_at: row.last_read_at, delivered_at: row.last_delivered_at } : x)));
       })
       .on("presence", { event: "sync" }, () => {
         const st = ch.presenceState<PresenceMeta>();
@@ -261,7 +270,12 @@ export default function ChatPage() {
 
   const jump = (id: string) => document.getElementById(`m-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   const others = members.filter((m) => m.user_id !== meId);
-  const isRead = (m: Msg) => others.length > 0 && others.every((o) => new Date(o.last_read_at) >= new Date(m.created_at));
+  const tickState = (m: Msg): TickState => {
+    const t = new Date(m.created_at).getTime();
+    if (others.length && others.every((o) => new Date(o.last_read_at).getTime() >= t)) return "read";
+    if (others.length && others.every((o) => new Date(o.delivered_at).getTime() >= t)) return "delivered";
+    return "sent";
+  };
   const lastPinned = msgs.find((m) => m.id === pins[pins.length - 1]);
   const typingText = typers.length === 0 ? "" : typers.length === 1 ? `${typers[0]} is typing…` : `${typers.slice(0, 2).join(" and ")} are typing…`;
 
@@ -269,7 +283,7 @@ export default function ChatPage() {
     <div className={`app${active ? " open" : ""}`}>
       <aside className="side">
         <header>
-          <div className="row"><strong>{tab === "chats" ? "Talkie" : "Calls"}</strong><span>{tab === "chats" && <button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button>} <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
+          <div className="row"><strong>{tab === "chats" ? "Talkie" : tab === "calls" ? "Calls" : "Profile"}</strong><span>{tab === "chats" && <button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button>} <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
           {tab === "chats" && grpMode && (
             <>
               <input aria-label="Group name" placeholder="Group name" value={grpName} onChange={(e) => setGrpName(e.target.value)} />
@@ -281,6 +295,8 @@ export default function ChatPage() {
         </header>
         {tab === "calls" ? (
           <div className="list">{meId && <CallsList meId={meId} />}</div>
+        ) : tab === "profile" ? (
+          <div className="list">{meId && <ProfilePanel meId={meId} onNameChange={setMyName} />}</div>
         ) : (
           <div className="list">
             {results.map((p) => (
@@ -302,6 +318,7 @@ export default function ChatPage() {
         <nav className="tabs" aria-label="Sections">
           <button aria-current={tab === "chats"} onClick={() => setTab("chats")}><span aria-hidden="true">💬</span>Chats</button>
           <button aria-current={tab === "calls"} onClick={() => setTab("calls")}><span aria-hidden="true">📞</span>Calls</button>
+          <button aria-current={tab === "profile"} onClick={() => setTab("profile")}><span aria-hidden="true">👤</span>Profile</button>
         </nav>
       </aside>
       <main className="chat">
@@ -330,7 +347,7 @@ export default function ChatPage() {
                     <small>
                       {pins.includes(m.id) && "📌 "}{m.is_edited && !m.is_deleted && "edited · "}
                       {new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                      {mine && !m.is_deleted && <span className={`ticks${isRead(m) ? " read" : ""}`} aria-label={isRead(m) ? "Read" : "Sent"}>{isRead(m) ? "✓✓" : "✓"}</span>}
+                      {mine && !m.is_deleted && <Ticks state={tickState(m)} />}
                       {!m.is_deleted && <button className="mini" onClick={() => setSel(sel === m.id ? null : m.id)} aria-label="Message actions">⋯</button>}
                     </small>
                     {sel === m.id && !m.is_deleted && (

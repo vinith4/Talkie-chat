@@ -7,7 +7,6 @@ import { enablePush, pushSupported, registerWorker } from "@/lib/push";
 import { Avatar } from "@/components/Avatar";
 import "./calls.css";
 import "./calls-mini.css";
-import "./calls-extra.css";
 
 type Peer = { id: string; name: string; conversationId: string };
 type SigType = "call-start" | "call-accept" | "call-reject" | "call-end" | "offer" | "answer" | "ice-candidate";
@@ -19,10 +18,10 @@ type SigRow = { call_id: string; from_id: string; type: SigType; payload: Partia
 type Call = { phase: "outgoing" | "incoming" | "connecting" | "connected"; kind: CallKind; peerId: string; peerName: string; conv: string; callId: string; outgoing: boolean; startedAt: number | null };
 type Outcome = "ENDED" | "REJECTED" | "MISSED";
 type Corner = "tl" | "tr" | "bl" | "br";
-type SinkEl = HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
+type SinkEl = HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-const BT = /bluetooth|buds|airpods|headset|headphone|hands-free|handsfree/i;
+const BT = /bluetooth|buds|airpods/i;
 const reason = (e: unknown) =>
   e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "NotFoundError") ? "Allow microphone/camera access to make calls."
     : e instanceof DOMException && e.name === "NotReadableError" ? "Camera or microphone is being used by another app or window."
@@ -48,7 +47,6 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const [secs, setSecs] = useState(0);
   const [note, setNote] = useState("");
   const [tick, setTick] = useState(0);
-  const [needAlerts, setNeedAlerts] = useState(false);
   const [corner, setCorner] = useState<Corner>("tr");
   const [dragXY, setDragXY] = useState<{ x: number; y: number } | null>(null);
   const [box, setBox] = useState({ w: 0, h: 0 });
@@ -57,6 +55,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
   const svc = useRef<WebRTCService | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
   const ovRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ dx: number; dy: number } | null>(null);
@@ -202,8 +201,8 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     setDevs({ outs: d.filter((x) => x.kind === "audiooutput"), ins: d.filter((x) => x.kind === "audioinput") });
   }
   async function chooseOut(id: string) {
-    const el = remoteRef.current as SinkEl | null;
-    if (!el?.setSinkId) { setNote("This browser can't switch speakers. Connect Bluetooth in your phone settings and it will be used automatically."); return; }
+    const el = audioRef.current as SinkEl | null;
+    if (!el?.setSinkId) { setNote("This browser can't switch speakers. Your system's selected output is used."); return; }
     try { await el.setSinkId(id); setOutId(id); } catch (e) { setNote(reason(e)); }
   }
   async function chooseIn(id: string) {
@@ -283,12 +282,15 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => window.removeEventListener("talkie:call", h);
   }, []);
 
-  // Background alerts: register worker, silently re-subscribe if already allowed
+  // Background alerts turn on automatically (the browser needs one tap/click to allow the permission prompt)
   useEffect(() => {
     if (!pushSupported()) return;
     void registerWorker().catch(() => {});
-    if (Notification.permission === "granted") void enablePush(false);
-    else if (Notification.permission === "default") setNeedAlerts(true);
+    if (Notification.permission === "granted") { void enablePush(false); return; }
+    if (Notification.permission !== "default") return;
+    const ask = () => { void enablePush(true); };
+    window.addEventListener("pointerdown", ask, { once: true });
+    return () => window.removeEventListener("pointerdown", ask);
   }, [meId]);
 
   // Notification buttons (Answer / Decline / Mute / End) arrive from the service worker
@@ -302,9 +304,9 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => navigator.serviceWorker.removeEventListener("message", h);
   }, []);
 
-  // Browsers only allow sound after a tap: unlock on the first interaction
+  // Browsers only allow sound after a tap/click: unlock sounds and resume call audio on interaction
   useEffect(() => {
-    const un = () => unlockAudio();
+    const un = () => { unlockAudio(); void audioRef.current?.play().catch(() => {}); };
     window.addEventListener("pointerdown", un);
     window.addEventListener("keydown", un);
     return () => { window.removeEventListener("pointerdown", un); window.removeEventListener("keydown", un); };
@@ -332,7 +334,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => ro.disconnect();
   }, [open, mini]);
 
-  // Audio devices: keep the list fresh and auto-route to a Bluetooth headset when one appears
+  // Audio devices list (only used by the speaker/microphone picker; the system default stays in charge)
   useEffect(() => {
     if (!call || call.phase === "incoming" || !navigator.mediaDevices) return;
     void loadDevs();
@@ -340,11 +342,6 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     navigator.mediaDevices.addEventListener("devicechange", h);
     return () => navigator.mediaDevices.removeEventListener("devicechange", h);
   }, [call?.phase]);
-  useEffect(() => {
-    if (!call || outId) return;
-    const bt = devs.outs.find((d) => BT.test(d.label));
-    if (bt) void chooseOut(bt.deviceId);
-  }, [devs, call?.phase]);
 
   // Ongoing-call notification with Mute / End buttons while the app is in the background
   useEffect(() => {
@@ -369,17 +366,20 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
     return () => { document.removeEventListener("visibilitychange", onVis); void clear(); };
   }, [call?.phase, call?.peerName, call?.kind, muted]);
 
-  // Attach media streams (re-run whenever a remote track arrives)
+  // Attach media streams. Sound plays through a dedicated <audio> element (reliable on laptops);
+  // the remote <video> only draws the picture.
   useEffect(() => {
     const s = svc.current;
     if (!s) return;
-    const attach = (el: HTMLVideoElement | null, stream: MediaStream | null) => {
+    const attach = (el: HTMLMediaElement | null, stream: MediaStream | null, loud: boolean) => {
       if (!el || !stream) return;
       if (el.srcObject !== stream) el.srcObject = stream;
-      void el.play().catch(() => {});
+      el.volume = 1;
+      void el.play().catch(() => { if (loud) setNote("Click anywhere to turn on call audio"); });
     };
-    attach(remoteRef.current, s.remoteStream);
-    attach(localRef.current, s.localStream);
+    attach(audioRef.current, s.remoteStream, true);
+    attach(remoteRef.current, s.remoteStream, false);
+    attach(localRef.current, s.localStream, false);
   }, [call?.phase, tick, mini]);
 
   useEffect(() => {
@@ -410,12 +410,10 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
           <button className="ghost" onClick={() => startCall("VIDEO")} aria-label="Video call">📹</button>
         </div>
       )}
-      {needAlerts && !call && (
-        <button className="ghost alertbtn" onClick={async () => { const r = await enablePush(true); if (r === "ok") setNeedAlerts(false); else setNote(r); }}>🔔 Turn on call alerts</button>
-      )}
       {call && (
         <div className={`callov${isVideo ? "" : " voice"}${mini && call.phase !== "incoming" ? " mini" : ""}`} ref={ovRef} role="dialog" aria-label="Call">
-          <video ref={remoteRef} autoPlay playsInline className={isVideo ? "remote" : "remote off"} />
+          <audio ref={audioRef} autoPlay />
+          <video ref={remoteRef} autoPlay playsInline muted className={isVideo ? "remote" : "remote off"} />
           {isVideo && <div className="shade" />}
           {call.phase !== "incoming" && !mini && (
             <div className="ctop">
@@ -455,7 +453,7 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
               <button className="pbtn" onClick={() => setSheet("more")} aria-label="More options"><Ico><circle cx="5" cy="12" r="1.6" fill="currentColor" /><circle cx="12" cy="12" r="1.6" fill="currentColor" /><circle cx="19" cy="12" r="1.6" fill="currentColor" /></Ico></button>
               <button className={`pbtn${isVideo && camOff ? " on" : ""}`} onClick={toggleCam} disabled={!isVideo} aria-label={camOff ? "Turn camera on" : "Turn camera off"}><Ico><path d="M3 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H3zM16 11l5-3v8l-5-3z" fill="currentColor" />{camOff && <path d="M4 4l16 16" />}</Ico></button>
               <button className={`pbtn${sheet === "audio" || btActive ? " on" : ""}`} onClick={() => { void loadDevs(); setSheet("audio"); }} aria-label="Audio output">
-                {btActive || (btOut && !outId) ? <Ico><path d="M7 7l10 10-5 5V2l5 5L7 17" /></Ico> : <Ico><path d="M4 9v6h4l5 4V5L8 9zM16 8a5 5 0 0 1 0 8" /></Ico>}
+                {btActive ? <Ico><path d="M7 7l10 10-5 5V2l5 5L7 17" /></Ico> : <Ico><path d="M4 9v6h4l5 4V5L8 9zM16 8a5 5 0 0 1 0 8" /></Ico>}
               </button>
               <button className={`pbtn${muted ? " on" : ""}`} onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"}><Ico><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3" />{muted && <path d="M4 4l16 16" />}</Ico></button>
               <button className="pbtn end" onClick={endCall} aria-label="End call"><Phone rot={135} /></button>
@@ -474,15 +472,15 @@ export function CallLayer({ meId, myName, peer }: { meId: string; myName: string
               ) : (
                 <>
                   <h3>Speaker</h3>
-                  {devs.outs.length === 0 && <div className="hint">Using your device&apos;s default speaker. If a Bluetooth headset is connected in phone settings, calls use it automatically.</div>}
+                  <button role="menuitemradio" aria-checked={outId === ""} onClick={() => void chooseOut("default").then(() => setOutId(""))}>System default</button>
                   {devs.outs.map((d, i) => (
-                    <button key={d.deviceId || i} role="menuitemradio" aria-checked={outId === d.deviceId} onClick={() => void chooseOut(d.deviceId)}>{d.label || (i === 0 ? "Default speaker" : `Speaker ${i + 1}`)}</button>
+                    <button key={d.deviceId || i} role="menuitemradio" aria-checked={outId === d.deviceId} onClick={() => void chooseOut(d.deviceId)}>{d.label || `Speaker ${i + 1}`}</button>
                   ))}
                   <h3>Microphone</h3>
                   {devs.ins.map((d, i) => (
                     <button key={d.deviceId || i} role="menuitemradio" aria-checked={inId === d.deviceId} onClick={() => void chooseIn(d.deviceId)}>{d.label || `Microphone ${i + 1}`}</button>
                   ))}
-                  <div className="hint">Pair Bluetooth headsets in your phone settings first. Then pick them here.</div>
+                  <div className="hint">Pair Bluetooth headsets in your device settings first. Then pick them here.</div>
                 </>
               )}
               <button onClick={() => setSheet(null)}>Close</button>
