@@ -14,7 +14,7 @@ import "./tabs.css";
 
 type Msg = { id: string; conversation_id: string; sender_id: string; content: string; reply_to_message_id: string | null; is_edited: boolean; is_deleted: boolean; created_at: string };
 type Prof = { id: string; display_name: string; username: string };
-type Conv = { id: string; title: string; isGroup: boolean; otherId: string | null };
+type Conv = { id: string; title: string; isGroup: boolean; otherId: string | null; last: string };
 type Reaction = { message_id: string; user_id: string; emoji: string };
 type Member = { user_id: string; last_read_at: string; delivered_at: string; name: string };
 type MineRow = { conversation_id: string; cleared_at: string | null; conversations: { last_message_at: string } | null };
@@ -26,6 +26,17 @@ const EMOJIS = ["👍", "❤️", "😂", "😮", "🙏"];
 /** supabase-js queries only run when awaited/thenned: this makes fire-and-forget calls actually execute. */
 const fire = (q: PromiseLike<unknown>) => { void Promise.resolve(q).catch(() => {}); };
 
+/** WhatsApp-style time for the chat list: time today, "Yesterday", otherwise the date. */
+function listTime(iso: string): string {
+  const d = new Date(iso);
+  const n = new Date();
+  if (d.toDateString() === n.toDateString()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const y = new Date(n);
+  y.setDate(n.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { day: "numeric", month: "short" });
+}
+
 export default function ChatPage() {
   const router = useRouter();
   const [tab, setTab] = useState<"chats" | "calls" | "profile">("chats");
@@ -34,7 +45,8 @@ export default function ChatPage() {
   const [convs, setConvs] = useState<Conv[]>([]);
   const [active, setActive] = useState<Conv | null>(null);
   const [info, setInfo] = useState(false);
-  const [confirmDel, setConfirmDel] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmBulk, setConfirmBulk] = useState(false);
   const [vis, setVis] = useState(true);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
@@ -57,17 +69,22 @@ export default function ChatPage() {
   const room = useRef<RealtimeChannel | null>(null);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const delivTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lp = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lpFired = useRef(false);
   const readMark = useRef("");
   const convsRef = useRef<Conv[]>([]);
   convsRef.current = convs;
+  const selecting = selected.size > 0;
+  const allSelected = convs.length > 0 && selected.size === convs.length;
 
-  // Chats you deleted stay hidden until someone sends a newer message
+  // Chats you deleted stay hidden until someone sends a newer message; newest chats first
   const loadConvs = useCallback(async (uid: string) => {
     const mine = await sb().from("conversation_members").select("conversation_id,cleared_at,conversations(last_message_at)").eq("user_id", uid);
     if (mine.error) return setError(mine.error.message);
-    const ids = ((mine.data ?? []) as unknown as MineRow[])
-      .filter((r) => !r.cleared_at || (!!r.conversations && new Date(r.conversations.last_message_at) > new Date(r.cleared_at)))
-      .map((r) => r.conversation_id);
+    const visible = ((mine.data ?? []) as unknown as MineRow[])
+      .filter((r) => !r.cleared_at || (!!r.conversations && new Date(r.conversations.last_message_at) > new Date(r.cleared_at)));
+    const lastById = new Map(visible.map((r) => [r.conversation_id, r.conversations?.last_message_at ?? ""]));
+    const ids = visible.map((r) => r.conversation_id);
     if (!ids.length) { setConvs([]); return; }
     const { data, error: err } = await sb().from("conversation_members")
       .select("conversation_id, user_id, conversations(type,name), profiles(display_name)")
@@ -77,9 +94,9 @@ export default function ChatPage() {
     for (const r of (data ?? []) as unknown as MemberRow[]) {
       if (seen.has(r.conversation_id)) continue;
       const isGroup = r.conversations?.type === "GROUP";
-      seen.set(r.conversation_id, { id: r.conversation_id, isGroup, otherId: isGroup ? null : r.user_id, title: isGroup ? (r.conversations?.name ?? "Group") : (r.profiles?.display_name ?? "Unknown") });
+      seen.set(r.conversation_id, { id: r.conversation_id, isGroup, last: lastById.get(r.conversation_id) ?? "", otherId: isGroup ? null : r.user_id, title: isGroup ? (r.conversations?.name ?? "Group") : (r.profiles?.display_name ?? "Unknown") });
     }
-    setConvs([...seen.values()]);
+    setConvs([...seen.values()].sort((a, b) => b.last.localeCompare(a.last)));
   }, []);
 
   // Is the app actually in front of the user? (blue ticks only when messages are really seen)
@@ -88,6 +105,13 @@ export default function ChatPage() {
     h();
     document.addEventListener("visibilitychange", h);
     return () => document.removeEventListener("visibilitychange", h);
+  }, []);
+
+  // Escape leaves selection mode
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") setSelected(new Set()); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
   }, []);
 
   // Session + profile
@@ -116,9 +140,9 @@ export default function ChatPage() {
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${meId}` }, () => void loadConvs(meId))
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (p) => {
         const row = p.new as Msg;
+        // keep the list ordered by latest activity (and bring back chats I deleted)
+        void loadConvs(meId);
         if (row.sender_id === meId) return;
-        // a chat I deleted comes back when a new message arrives
-        if (!convsRef.current.some((c) => c.id === row.conversation_id)) void loadConvs(meId);
         if (delivTimer.current) clearTimeout(delivTimer.current);
         delivTimer.current = setTimeout(() => fire(sb().rpc("mark_delivered")), 400);
       })
@@ -131,7 +155,7 @@ export default function ChatPage() {
     if (!active || !meId) return;
     const cid = active.id;
     let cancelled = false;
-    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null); setInfo(false); setConfirmDel(false);
+    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null); setInfo(false);
     (async () => {
       const mc = await sb().from("conversation_members").select("cleared_at").eq("conversation_id", cid).eq("user_id", meId).single();
       const cleared = (mc.data as { cleared_at: string | null } | null)?.cleared_at ?? null;
@@ -217,7 +241,7 @@ export default function ChatPage() {
     const { data, error: err } = await sb().rpc("start_direct_conversation", { other: p.id });
     if (err || !meId) return setError(err?.message ?? "Could not start chat");
     await loadConvs(meId);
-    setActive({ id: data as string, title: p.display_name, isGroup: false, otherId: p.id });
+    setActive({ id: data as string, title: p.display_name, isGroup: false, otherId: p.id, last: "" });
     setQuery(""); setResults([]);
   }
 
@@ -227,7 +251,7 @@ export default function ChatPage() {
     const { data, error: err } = await sb().rpc("create_group", { p_name: grpName.trim(), p_members: grpMembers.map((m) => m.id) });
     if (err) return setError(err.message);
     await loadConvs(meId);
-    setActive({ id: data as string, title: grpName.trim(), isGroup: true, otherId: null });
+    setActive({ id: data as string, title: grpName.trim(), isGroup: true, otherId: null, last: "" });
     setGrpMode(false); setGrpName(""); setGrpMembers([]); setQuery(""); setResults([]);
   }
 
@@ -238,13 +262,35 @@ export default function ChatPage() {
     setActive(null); await loadConvs(meId);
   }
 
-  // Delete chat for me only: the other person keeps their copy of the conversation
-  async function deleteChat() {
-    if (!active || !meId) return;
-    const { error: err } = await sb().rpc("clear_chat", { cid: active.id });
-    setConfirmDel(false);
-    if (err) return setError(err.message);
-    setActive(null); setMsgs([]);
+  // Long-press (or right-click) a chat to start selecting; tap to add/remove more
+  function pressStart(id: string) {
+    if (selected.size) return;
+    lpFired.current = false;
+    lp.current = setTimeout(() => {
+      lpFired.current = true;
+      setSelected(new Set([id]));
+      try { navigator.vibrate?.(20); } catch { /* not supported */ }
+    }, 450);
+  }
+  function pressCancel() { if (lp.current) { clearTimeout(lp.current); lp.current = null; } }
+  function onItemClick(c: Conv) {
+    if (lpFired.current) { lpFired.current = false; return; }
+    if (selected.size) {
+      setSelected((s) => { const n = new Set(s); if (n.has(c.id)) n.delete(c.id); else n.add(c.id); return n; });
+    } else setActive(c);
+  }
+  function toggleAll() { setSelected(allSelected ? new Set() : new Set(convs.map((c) => c.id))); }
+
+  // Delete the selected chats for me only: other people keep their copy
+  async function deleteSelected() {
+    if (!meId) return;
+    const ids = [...selected];
+    setConfirmBulk(false);
+    const res = await Promise.all(ids.map((id) => sb().rpc("clear_chat", { cid: id })));
+    const bad = res.find((r) => r.error);
+    setSelected(new Set());
+    if (active && ids.includes(active.id)) { setActive(null); setMsgs([]); }
+    if (bad?.error) setError(bad.error.message);
     await loadConvs(meId);
   }
 
@@ -277,7 +323,7 @@ export default function ChatPage() {
     const row = data as Msg;
     setMsgs((c) => (c.some((m) => m.id === row.id) ? c : [...c, row]));
     setReplyTo(null);
-    if (!convsRef.current.some((c) => c.id === active.id)) void loadConvs(meId); // a deleted chat reappears once you write again
+    void loadConvs(meId); // moves this chat to the top (and brings back a deleted one)
   }
 
   async function remove(m: Msg) {
@@ -317,20 +363,32 @@ export default function ChatPage() {
   };
   const lastPinned = msgs.find((m) => m.id === pins[pins.length - 1]);
   const typingText = typers.length === 0 ? "" : typers.length === 1 ? `${typers[0]} is typing…` : `${typers.slice(0, 2).join(" and ")} are typing…`;
+  const activeOnline = !!active?.otherId && online.has(active.otherId);
 
   return (
     <div className={`app${active ? " open" : ""}`}>
       <aside className="side">
         <header>
-          <div className="row"><strong>{tab === "chats" ? "Talkie" : tab === "calls" ? "Calls" : "Profile"}</strong><span>{tab === "chats" && <button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button>} <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
-          {tab === "chats" && grpMode && (
+          {selecting && tab === "chats" ? (
+            <div className="selbar">
+              <button className="ghost" onClick={() => setSelected(new Set())} aria-label="Cancel selection">✕</button>
+              <span className="count">{selected.size} selected</span>
+              <button className="ghost" onClick={toggleAll}>{allSelected ? "Unselect all" : "Select all"}</button>
+              <button className="danger" onClick={() => setConfirmBulk(true)} aria-label="Delete selected chats">🗑 Delete</button>
+            </div>
+          ) : (
             <>
-              <input aria-label="Group name" placeholder="Group name" value={grpName} onChange={(e) => setGrpName(e.target.value)} />
-              <div className="chips">{grpMembers.map((g) => <span key={g.id} className="chip">{g.display_name}</span>)}</div>
-              <button onClick={createGroup}>Create group</button>
+              <div className="row"><strong>{tab === "chats" ? "Talkie" : tab === "calls" ? "Calls" : "Profile"}</strong><span>{tab === "chats" && <button className="ghost" onClick={() => setGrpMode(!grpMode)}>{grpMode ? "Cancel" : "New group"}</button>} <button className="ghost" onClick={() => sb().auth.signOut()}>Sign out</button></span></div>
+              {tab === "chats" && grpMode && (
+                <>
+                  <input aria-label="Group name" placeholder="Group name" value={grpName} onChange={(e) => setGrpName(e.target.value)} />
+                  <div className="chips">{grpMembers.map((g) => <span key={g.id} className="chip">{g.display_name}</span>)}</div>
+                  <button onClick={createGroup}>Create group</button>
+                </>
+              )}
+              {tab === "chats" && <input className="search" aria-label="Search people" placeholder={grpMode ? "Search people to add" : "Search or find people to chat with"} value={query} onChange={(e) => setQuery(e.target.value)} />}
             </>
           )}
-          {tab === "chats" && <input aria-label="Search people" placeholder={grpMode ? "Search people to add" : "Find people to chat with"} value={query} onChange={(e) => setQuery(e.target.value)} />}
         </header>
         {tab === "calls" ? (
           <div className="list">{meId && <CallsList meId={meId} />}</div>
@@ -341,40 +399,58 @@ export default function ChatPage() {
             {results.map((p) => (
               <button key={p.id} className="item" onClick={() => (grpMode ? setGrpMembers((c) => (c.some((x) => x.id === p.id) ? c : [...c, p])) : startChat(p))}>
                 <Avatar userId={p.id} name={p.display_name} />
-                <span><div>{p.display_name}</div><div className="muted">@{p.username} · {grpMode ? "add to group" : "start chat"}</div></span>
+                <span className="meta"><span className="name">{p.display_name}</span><span className="l2">@{p.username} · {grpMode ? "add to group" : "start chat"}</span></span>
               </button>
             ))}
             {loading && <p className="muted" style={{ padding: 14 }}>Loading…</p>}
-            {!loading && !convs.length && !results.length && <p className="empty" style={{ padding: 24 }}>No conversations yet.<br />Search for someone to start one.</p>}
-            {convs.map((c) => (
-              <button key={c.id} className="item" aria-current={active?.id === c.id} onClick={() => setActive(c)}>
-                {c.isGroup ? <span className="avatar">#</span> : <Avatar userId={c.otherId} name={c.title} />}
-                <span>{c.title}{c.otherId && online.has(c.otherId) && <span className="dot" aria-label="online" />}</span>
-              </button>
-            ))}
+            {!loading && !convs.length && !results.length && (
+              <div className="empty"><div className="bigico">👋</div><h3>No chats yet</h3><p>Search for someone above to start a conversation.</p></div>
+            )}
+            {convs.map((c) => {
+              const isSel = selected.has(c.id);
+              const isOn = !!c.otherId && online.has(c.otherId);
+              return (
+                <button
+                  key={c.id} className={`item${isSel ? " sel" : ""}`} aria-current={active?.id === c.id} aria-pressed={selecting ? isSel : undefined}
+                  onPointerDown={() => pressStart(c.id)} onPointerUp={pressCancel} onPointerLeave={pressCancel} onPointerCancel={pressCancel}
+                  onContextMenu={(e) => { e.preventDefault(); setSelected((s) => (s.size ? s : new Set([c.id]))); }}
+                  onClick={() => onItemClick(c)}
+                >
+                  <span className="avwrap">
+                    {c.isGroup ? <span className="avatar">#</span> : <Avatar userId={c.otherId} name={c.title} />}
+                    {isSel ? <span className="chk" aria-hidden="true">✓</span> : isOn ? <span className="dot" aria-label="online" /> : null}
+                  </span>
+                  <span className="meta">
+                    <span className="l1"><span className="name">{c.title}</span>{c.last && <span className="time">{listTime(c.last)}</span>}</span>
+                    <span className={`l2${isOn ? " on" : ""}`}>{c.isGroup ? "Group" : isOn ? "online" : "Tap to chat"}</span>
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
         <nav className="tabs" aria-label="Sections">
           <button aria-current={tab === "chats"} onClick={() => setTab("chats")}><span aria-hidden="true">💬</span>Chats</button>
-          <button aria-current={tab === "calls"} onClick={() => setTab("calls")}><span aria-hidden="true">📞</span>Calls</button>
-          <button aria-current={tab === "profile"} onClick={() => setTab("profile")}><span aria-hidden="true">👤</span>Profile</button>
+          <button aria-current={tab === "calls"} onClick={() => { setTab("calls"); setSelected(new Set()); }}><span aria-hidden="true">📞</span>Calls</button>
+          <button aria-current={tab === "profile"} onClick={() => { setTab("profile"); setSelected(new Set()); }}><span aria-hidden="true">👤</span>Profile</button>
         </nav>
       </aside>
       <main className="chat">
-        {!active ? <p className="empty">Select a conversation</p> : (
+        {!active ? (
+          <div className="empty"><div className="bigico">💬</div><h3>Talkie</h3><p>Select a chat to start messaging.<br />Touch and hold a chat to select and delete.</p></div>
+        ) : (
           <>
             <header>
               <button className="ghost back" onClick={() => setActive(null)} aria-label="Back">←</button>
               <button className="hdrbtn top" onClick={() => setInfo(true)} aria-label={active.isGroup ? "Group info" : `View ${active.title}'s profile`}>
                 {active.isGroup ? <span className="avatar">#</span> : <Avatar userId={active.otherId} name={active.title} />}
-                <span><strong>{active.title}</strong><small>{active.isGroup ? `${members.length} members` : active.otherId && online.has(active.otherId) ? "Online" : "Offline"}</small></span>
+                <span><strong>{active.title}</strong><small className={activeOnline ? "on" : undefined}>{active.isGroup ? `${members.length} members` : activeOnline ? "online" : "offline"}</small></span>
               </button>
-              <button className="ghost" onClick={() => setConfirmDel(true)} aria-label="Delete chat" title="Delete chat">🗑</button>
               {active.isGroup && <button className="ghost" onClick={leaveGroup}>Leave</button>}
             </header>
             {lastPinned && <div className="pinbar">📌 <button onClick={() => jump(lastPinned.id)}>{lastPinned.content}</button><span className="muted">{pins.length} pinned</span></div>}
             <div className="msgs">
-              {msgs.length === 0 && <p className="empty">No messages yet. Say hi 👋</p>}
+              {msgs.length === 0 && <div className="empty"><div className="bigico">👋</div><p>No messages yet. Say hi!</p></div>}
               {msgs.map((m) => {
                 const mine = m.sender_id === meId;
                 const parent = m.reply_to_message_id ? msgs.find((x) => x.id === m.reply_to_message_id) : undefined;
@@ -416,20 +492,22 @@ export default function ChatPage() {
             )}
             <form className="composer" onSubmit={send}>
               <input aria-label="Message" placeholder="Type a message" value={text} onChange={(e) => onType(e.target.value)} maxLength={4000} />
-              <button>{editing ? "Save" : "Send"}</button>
+              <button aria-label={editing ? "Save edit" : "Send message"}>
+                {editing ? "✓" : <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3.4 20.4 21 12 3.4 3.6l-.1 6.5L15 12 3.3 13.9z" /></svg>}
+              </button>
             </form>
           </>
         )}
         {error && <div className="err" role="alert" style={{ padding: 8 }} onClick={() => setError("")}>{error}</div>}
       </main>
-      {confirmDel && active && (
-        <div className="infoov" onClick={() => setConfirmDel(false)} role="presentation">
-          <div className="infocard" role="alertdialog" aria-label="Delete chat" onClick={(e) => e.stopPropagation()}>
-            <h2>Delete this chat?</h2>
-            <div className="sub">The messages will be removed for you only. {active.isGroup ? "Other members" : active.title} will still see the conversation.</div>
+      {confirmBulk && (
+        <div className="infoov" onClick={() => setConfirmBulk(false)} role="presentation">
+          <div className="infocard" role="alertdialog" aria-label="Delete chats" onClick={(e) => e.stopPropagation()}>
+            <h2>Delete {selected.size === 1 ? "this chat" : `${selected.size} chats`}?</h2>
+            <div className="sub">Messages are removed for you only. The other people will still see the conversation.</div>
             <div className="irow">
-              <button className="ghost" onClick={() => setConfirmDel(false)}>Cancel</button>
-              <button style={{ background: "#dc2626" }} onClick={deleteChat}>Delete chat</button>
+              <button className="ghost" onClick={() => setConfirmBulk(false)}>Cancel</button>
+              <button className="danger" onClick={deleteSelected}>Delete</button>
             </div>
           </div>
         </div>
