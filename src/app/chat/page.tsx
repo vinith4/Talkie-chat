@@ -17,6 +17,7 @@ type Prof = { id: string; display_name: string; username: string };
 type Conv = { id: string; title: string; isGroup: boolean; otherId: string | null };
 type Reaction = { message_id: string; user_id: string; emoji: string };
 type Member = { user_id: string; last_read_at: string; delivered_at: string; name: string };
+type MineRow = { conversation_id: string; cleared_at: string | null; conversations: { last_message_at: string } | null };
 type MemberRow = { conversation_id: string; user_id: string; conversations: { type: string; name: string | null } | null; profiles: { display_name: string } | null };
 type PresenceMeta = { typing?: boolean; name?: string };
 
@@ -33,6 +34,7 @@ export default function ChatPage() {
   const [convs, setConvs] = useState<Conv[]>([]);
   const [active, setActive] = useState<Conv | null>(null);
   const [info, setInfo] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
   const [vis, setVis] = useState(true);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
@@ -56,11 +58,16 @@ export default function ChatPage() {
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const delivTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readMark = useRef("");
+  const convsRef = useRef<Conv[]>([]);
+  convsRef.current = convs;
 
+  // Chats you deleted stay hidden until someone sends a newer message
   const loadConvs = useCallback(async (uid: string) => {
-    const mine = await sb().from("conversation_members").select("conversation_id").eq("user_id", uid);
+    const mine = await sb().from("conversation_members").select("conversation_id,cleared_at,conversations(last_message_at)").eq("user_id", uid);
     if (mine.error) return setError(mine.error.message);
-    const ids = (mine.data ?? []).map((r) => r.conversation_id as string);
+    const ids = ((mine.data ?? []) as unknown as MineRow[])
+      .filter((r) => !r.cleared_at || (!!r.conversations && new Date(r.conversations.last_message_at) > new Date(r.cleared_at)))
+      .map((r) => r.conversation_id);
     if (!ids.length) { setConvs([]); return; }
     const { data, error: err } = await sb().from("conversation_members")
       .select("conversation_id, user_id, conversations(type,name), profiles(display_name)")
@@ -108,7 +115,10 @@ export default function ChatPage() {
     const mine = sb().channel(`mine:${meId}`)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: `user_id=eq.${meId}` }, () => void loadConvs(meId))
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (p) => {
-        if ((p.new as Msg).sender_id === meId) return;
+        const row = p.new as Msg;
+        if (row.sender_id === meId) return;
+        // a chat I deleted comes back when a new message arrives
+        if (!convsRef.current.some((c) => c.id === row.conversation_id)) void loadConvs(meId);
         if (delivTimer.current) clearTimeout(delivTimer.current);
         delivTimer.current = setTimeout(() => fire(sb().rpc("mark_delivered")), 400);
       })
@@ -116,14 +126,18 @@ export default function ChatPage() {
     return () => { void sb().removeChannel(pres); void sb().removeChannel(mine); };
   }, [meId, loadConvs]);
 
-  // Active conversation: history, reactions, pins, members + realtime
+  // Active conversation: history (only after the point I deleted it), reactions, pins, members + realtime
   useEffect(() => {
     if (!active || !meId) return;
     const cid = active.id;
     let cancelled = false;
-    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null); setInfo(false);
+    setMsgs([]); setReactions([]); setPins([]); setMembers([]); setTypers([]); setReplyTo(null); setEditing(null); setSel(null); setInfo(false); setConfirmDel(false);
     (async () => {
-      const m = await sb().from("messages").select("*").eq("conversation_id", cid).order("created_at", { ascending: false }).limit(50);
+      const mc = await sb().from("conversation_members").select("cleared_at").eq("conversation_id", cid).eq("user_id", meId).single();
+      const cleared = (mc.data as { cleared_at: string | null } | null)?.cleared_at ?? null;
+      let q = sb().from("messages").select("*").eq("conversation_id", cid);
+      if (cleared) q = q.gt("created_at", cleared);
+      const m = await q.order("created_at", { ascending: false }).limit(50);
       if (cancelled) return;
       if (m.error) return setError(m.error.message);
       const list = ((m.data ?? []) as Msg[]).reverse();
@@ -224,6 +238,16 @@ export default function ChatPage() {
     setActive(null); await loadConvs(meId);
   }
 
+  // Delete chat for me only: the other person keeps their copy of the conversation
+  async function deleteChat() {
+    if (!active || !meId) return;
+    const { error: err } = await sb().rpc("clear_chat", { cid: active.id });
+    setConfirmDel(false);
+    if (err) return setError(err.message);
+    setActive(null); setMsgs([]);
+    await loadConvs(meId);
+  }
+
   function onType(v: string) {
     setText(v);
     const ch = room.current;
@@ -253,6 +277,7 @@ export default function ChatPage() {
     const row = data as Msg;
     setMsgs((c) => (c.some((m) => m.id === row.id) ? c : [...c, row]));
     setReplyTo(null);
+    if (!convsRef.current.some((c) => c.id === active.id)) void loadConvs(meId); // a deleted chat reappears once you write again
   }
 
   async function remove(m: Msg) {
@@ -344,10 +369,12 @@ export default function ChatPage() {
                 {active.isGroup ? <span className="avatar">#</span> : <Avatar userId={active.otherId} name={active.title} />}
                 <span><strong>{active.title}</strong><small>{active.isGroup ? `${members.length} members` : active.otherId && online.has(active.otherId) ? "Online" : "Offline"}</small></span>
               </button>
+              <button className="ghost" onClick={() => setConfirmDel(true)} aria-label="Delete chat" title="Delete chat">🗑</button>
               {active.isGroup && <button className="ghost" onClick={leaveGroup}>Leave</button>}
             </header>
             {lastPinned && <div className="pinbar">📌 <button onClick={() => jump(lastPinned.id)}>{lastPinned.content}</button><span className="muted">{pins.length} pinned</span></div>}
             <div className="msgs">
+              {msgs.length === 0 && <p className="empty">No messages yet. Say hi 👋</p>}
               {msgs.map((m) => {
                 const mine = m.sender_id === meId;
                 const parent = m.reply_to_message_id ? msgs.find((x) => x.id === m.reply_to_message_id) : undefined;
@@ -395,6 +422,18 @@ export default function ChatPage() {
         )}
         {error && <div className="err" role="alert" style={{ padding: 8 }} onClick={() => setError("")}>{error}</div>}
       </main>
+      {confirmDel && active && (
+        <div className="infoov" onClick={() => setConfirmDel(false)} role="presentation">
+          <div className="infocard" role="alertdialog" aria-label="Delete chat" onClick={(e) => e.stopPropagation()}>
+            <h2>Delete this chat?</h2>
+            <div className="sub">The messages will be removed for you only. {active.isGroup ? "Other members" : active.title} will still see the conversation.</div>
+            <div className="irow">
+              <button className="ghost" onClick={() => setConfirmDel(false)}>Cancel</button>
+              <button style={{ background: "#dc2626" }} onClick={deleteChat}>Delete chat</button>
+            </div>
+          </div>
+        </div>
+      )}
       {info && active && meId && (active.isGroup || active.otherId) && (
         <InfoSheet
           meId={meId} online={online} onClose={() => setInfo(false)}
